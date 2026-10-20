@@ -1,0 +1,36 @@
+[tools]
+python = "3.14.5"
+uv = "0.13.1"
+
+[env]
+# Use mise's interpreter; do not let uv download a second Python installation.
+UV_PYTHON = "python"
+UV_PYTHON_DOWNLOADS = "never"
+
+[tasks.setup]
+description = "Install locked Python dependencies"
+run = "uv sync --locked"
+
+[tasks.inspect]
+description = "Inspect mounted audio CDs and macOS disk information"
+run = "uv run --locked diskflow inspect"
+
+[tasks.probe]
+description = "Read a few CDDA sectors twice (requires an explicit device)"
+run = "uv run --locked diskflow probe"
+
+[tasks.rip]
+description = "Read the audio image twice and compare every byte"
+run = "uv run --locked diskflow rip"
+
+[tasks.test]
+run = "uv run --locked pytest"
+
+[tasks.lint]
+run = "uv run --locked ruff check . && uv run --locked ruff format --check ."
+
+[tasks.format]
+run = "uv run --locked ruff format . && uv run --locked ruff check --fix ."
+
+[tasks.check]
+depends = ["lint", "test"]

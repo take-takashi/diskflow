@@ -205,6 +205,9 @@ cython_debug/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
 
+# Local CD images, samples, and hardware reports (never commit audio)
+/artifacts/
+
 # Ruff stuff:
 .ruff_cache/
 

@@ -1,2 +1,177 @@
 # diskflow
-CDをpythonで取り込む試み。
+
+macOSで音楽CDをPythonから読み取れるか検証するPoC。
+まずはCD読み取りに絞り、AAC変換・メタデータ取得・Notion連携は扱わない。
+
+PIONEER BDR-TD05で13曲のCD全体を2回読み取り、全バイトの一致を確認済み。
+読み取り処理はPython標準ライブラリだけで動作した。ただし、原本保存品質は未検証。
+環境・実行結果・制約は[実機検証結果](docs/cd-reading-poc.md)を参照。
+
+## 環境管理
+
+- `mise.toml`でPython 3.14.5とuv 0.13.1を固定する。
+- uvで`.venv`とPythonパッケージを管理し、`uv.lock`をコミットする。
+- uvはmiseのPythonを使う。uvによる別のPythonのダウンロードは無効にする。
+- 読み取り処理の依存はPython標準ライブラリのみ。pytest・Ruffは開発用。
+
+64-bit macOSとmiseが必要。Homebrewパッケージ、FFmpeg、cdrdao、コンパイラは
+読み取りコマンドの実行に不要。
+デバイスの調査にはmacOS標準の`diskutil`と`ioreg`を使う。
+音声データは外部コマンドではなく、Pythonの`ctypes`と`fcntl.ioctl`で読み取る。
+
+```sh
+mise trust
+mise install
+mise run setup
+mise run check
+```
+
+以降のコマンドも`mise run`で実行する。直接uvを呼ぶ場合は`mise exec -- uv ...`を使う。
+
+## 実機での検証手順
+
+### 1. CDの構造を調べる
+
+音楽CDを挿入し、Music.appなどによる再生・取り込みは止めておく。
+
+```sh
+mise run inspect -- --output artifacts/inspect-01.json
+```
+
+`/Volumes/*/.TOC.plist`、トラックファイルの名前とサイズ、IORegistry上のCD情報、
+ディスク一覧をJSONに記録する。音声データはまだ読まない。
+マウント先を指定して調べることもできる。
+
+```sh
+mise run inspect -- "/Volumes/Audio CD" --output artifacts/inspect-02.json
+```
+
+マウントが0件でも、未マウントのCDがあれば`cd_media`に現れる場合がある。
+`cd_media`内の`BSD Name`やマウントの`disk_info`を確認し、CDのwhole diskを特定する。
+`DeviceIdentifier`がパーティション（例：`disk8s1`）なら、
+`ParentWholeDisk`などから親の`disk8`を確認する。番号を推測しない。
+
+### 2. 少量のCDDAセクターを読む
+
+以下の`rdisk8`は例。必ず調査結果で確認したCDデバイスに置き換える。
+
+```sh
+mise run probe -- /dev/rdisk8 --output artifacts/probe-01
+```
+
+TOCで分かる各曲の先頭・中央・末尾付近を1セクターずつ、最低2パス読み取る。
+2パス目以降を最初のデータとバイト単位で比較し、短い読み取りも失敗として扱う。
+probeの一致は、サンプル位置での読み取りが一致したことだけを示す。
+
+対象は単一セッションの全曲オーディオCDのみ。
+データトラックを含むCD、CD Extraなどの複数セッション、4チャンネルCDは拒否し、
+読み取れた部分だけで取り込み成功とはしない。
+
+### 3. 音声イメージを読む
+
+probeが通ったら全体を読み取る。最低2パスなので、通常の1回の取り込みより時間がかかる。
+出力用に約800 MB以上の空きを用意する。
+
+```sh
+mise run rip -- /dev/rdisk8 --output artifacts/rip-01
+```
+
+LBA 0からリードアウト直前までの2352バイトCDDAセクターを保存する。
+全パスの全バイトが一致し、各パス終了時のTOCが変わっていない場合に限り、
+`audio.bin.part`を`audio.bin`へ変更する。
+
+読み取り単位がドライブに合わない場合などは、新しい出力先で条件を変えて試す。
+
+```sh
+mise run probe -- /dev/rdisk8 --output artifacts/probe-02 --passes 3
+mise run rip -- /dev/rdisk8 --output artifacts/rip-02 --chunk-sectors 1 --passes 3
+```
+
+probeは常に1セクター単位。ripは`--chunk-sectors`で1〜75セクターに変更できる。
+`--retries 2`はI/Oエラー・短い読み取りに対する追加の試行回数で、初回と合わせて最大3回。
+パス間でデータが異なる場合は、多数決やゼロ埋めで補わず停止する。
+
+デバイスは読み取り専用で開く。自動の権限昇格・アンマウント・排出はしない。
+`Permission denied`はデバイスの読み取り権限の問題であり、それだけで方式が非対応とは判断しない。
+権限エラー、非対応のioctl、I/Oエラーは区別して調べる。
+
+## 出力と結果の読み方
+
+出力先は毎回新しいディレクトリを指定する。既存のディレクトリや調査JSONは上書きしない。
+`artifacts/`はGit管理対象外。音声データや端末固有の調査情報をコミットしない。
+
+| ファイル | 内容 |
+| --- | --- |
+| `toc.bin` | macOSのformat 0x02 TOCバイナリ |
+| `toc.json` | セッション、トラック、INDEX 01開始LBA、リードアウト |
+| `reads.jsonl` | 各パス・LBA・試行回数・読み取り結果・SHA-256 |
+| `report.json` | 実行条件、状態、パスごとのハッシュ、失敗理由 |
+| `audio.bin` | ripで読み取りが一致したCDDA user data |
+| `disc.cue` | ripのイメージに対するINDEX 01中心の暫定CUE |
+| `samples.bin` / `sample-map.json` | probeのサンプルと元のLBA・保存位置の対応 |
+
+`report.json`の`status: reads_matched`は反復読み取りの一致を示す。
+`archival_verified`は常に`false`で、ビット完全な原本保存を保証する結果ではない。
+失敗・Ctrl-C時は`status: failed`として、途中の`.part`と取得済みの記録を残す。
+強制終了などで記録を更新できなかった場合は`running`のまま残る。
+終了コードは一致時が0、エラー時が1、中断時が130。
+この段階では途中再開に未対応なので、再試行には別の出力先を使う。
+
+## 読み取り方式
+
+通常の`open('/dev/rdiskN').read()`がCD音声を返すとは仮定しない。
+macOSのCD専用ioctlをPythonから呼び出す。
+
+- `DKIOCCDREADTOC`でfull TOCを取得し、`plistlib`によるマウント情報の調査と切り分ける。
+- `DKIOCCDREAD`で`kCDSectorTypeCDDA`＋`kCDSectorAreaUser`を指定する。
+- オフセットは`LBA × 2352`バイト。2048バイトのデータCDとは区別する。
+- バッファの実転送量を確認し、短い読み取りを正常終了として扱わない。
+
+`.TOC.plist`の`Start Block`と`Leadout Block`は絶対MSFをフレーム数にした値で、
+LBAへの変換には150を引く。例えば`Start Block = 150`がLBA 0。
+一方、binary full TOCはMSFからLBAへ直接変換する。CUEの位置はイメージ先頭からの相対位置。
+
+macOSのcddafs実装に合わせ、音声を44.1 kHz・16-bit・ステレオのlittle-endian PCMとして扱う。
+cddafsの拡張子`.aiff`はAIFF-Cの`sowt`の場合があり、
+ヘッダーがbig-endianだから音声もbig-endianとは限らない。
+今後トラックファイルと比較する際も、固定バイト数のヘッダー除去ではなくSSNDを解析する。
+
+ABIはApple SDKの`IOCDMediaBSDClient.h`・`IOCDTypes.h`・`sys/ioccom.h`を参照した。
+開発環境ではSDKから構造体サイズ・フィールド位置・ioctl定数を確認済み。
+実行時にはSDKを使わず、定義済みの64-bit ABIを利用する。
+
+## 原本保存に向けた未検証項目
+
+- ドライブキャッシュを無効化していないため、複数パスが独立した物理読み取りとは限らない。
+- C2エラーフラグ、ジッター補正、読み取りオフセット補正、AccurateRip照合は未実装。
+- 保存するのは2352バイトの音声部分のみ。サブチャンネル・CD-TEXTなどは含まない。
+- TOCだけでは各曲のINDEX 00や全INDEXを復元できず、CUEは完全ではない。
+- LBA 0より前のプリギャップ、リードイン、リードアウト本体は保存しない。
+- pre-emphasisフラグはCUEに残すが、音声にはディエンファシス処理をしない。
+- 同じTOCの別ディスクへの交換までは検知できない。実行中はCDを交換しない。
+
+今回の実機検証では、cddafsのAIFF-C形式・PCM長を全13曲で確認し、
+各曲の先頭・中央・末尾付近のPCMが保存イメージと一致した。
+次はcddafsとの全曲PCM比較、別チャンクサイズや再挿入後の比較、
+傷のあるCDでの失敗検知を行う。
+必要ならcdrdaoの取り込み結果とも比較する。
+読み取りが成立しても検証品質が足りなければ、Pythonのみの実装には固執しない。
+このPoCだけを根拠にCD原本を処分しない。
+
+## 開発
+
+```sh
+mise run check     # モックを使ったテスト、lint、フォーマット確認
+mise run format    # フォーマットとlintの自動修正
+```
+
+テストは実デバイスを開かない。
+TOC解析、ABI、2352バイト単位のオフセット、短い読み取り、再試行、パス間不一致、
+TOC変更、中断、上書き拒否を確認する。
+
+## 参照
+
+- [Apple IOCDMediaBSDClient.h](https://github.com/apple-oss-distributions/IOCDStorageFamily/blob/main/IOCDMediaBSDClient.h)
+- [Apple IOCDTypes.h](https://github.com/apple-oss-distributions/IOCDStorageFamily/blob/main/IOCDTypes.h)
+- [Apple cddafsのTOC生成処理](https://github.com/apple-oss-distributions/cddafs/blob/main/FilesystemProber/cddafs_util.cpp)
+- [Apple cddafsのAIFF-Cヘッダー生成処理](https://github.com/apple-oss-distributions/cddafs/blob/main/AIFFSupport.c)

@@ -1,0 +1,27 @@
+[project]
+name = "diskflow"
+version = "0.1.0"
+description = "A standard-library-only macOS audio CD reading experiment"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = []
+
+[project.scripts]
+diskflow = "diskflow.cli:main"
+
+[build-system]
+requires = ["uv_build==0.13.1"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = ["pytest>=8", "ruff>=0.11"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py314"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
