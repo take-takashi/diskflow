@@ -1,7 +1,8 @@
 # diskflow
 
 macOSで音楽CDをPythonから読み取れるか検証するPoC。
-まずはCD読み取りに絞り、AAC変換・メタデータ取得・Notion連携は扱わない。
+CD読み取りの検証と、無加工の曲別WAV出力を対象とする。
+AAC変換・メタデータ取得・Notion連携はまだ扱わない。
 
 PIONEER BDR-TD05で13曲のCD全体を2回読み取り、全バイトの一致を確認済み。
 読み取り処理はPython標準ライブラリだけで動作した。ただし、原本保存品質は未検証。
@@ -95,6 +96,45 @@ probeは常に1セクター単位。ripは`--chunk-sectors`で1〜75セクター
 `Permission denied`はデバイスの読み取り権限の問題であり、それだけで方式が非対応とは判断しない。
 権限エラー、非対応のioctl、I/Oエラーは区別して調べる。
 
+### 4. cddafsと全曲のPCMを比較する
+
+同じCDを挿入した状態で、保存済みイメージとcddafsの全曲PCMを比較する。
+デバイス番号は使わず、現在のCDマウント先を明示する。
+
+```sh
+mise run compare -- artifacts/rip-01 --mount "/Volumes/Audio CD" --output artifacts/compare-01
+```
+
+保存イメージ・TOCのハッシュとサイズ、マウントされたCDのTOC、全トラックの番号・形式・PCM長を
+確認してから、各曲の全バイトを比較する。AIFF/AIFF-CのCOMM・SSNDを解析し、
+big-endianの無圧縮PCMはlittle-endianへ並べ替えて比較する。
+不一致時は曲番号・最初の相違LBA・バイト位置をレポートに記録し、終了コード1を返す。
+最初のINDEX 01より前の音声は比較対象外とし、対象外のセクター数をレポートに記録する。
+これは同じドライブとOSを使う比較であり、独立したセキュアリッピングの検証ではない。
+
+### 5. 保存済みイメージから曲別WAVを作る
+
+CDを再読み取りせず、`audio.bin`とTOCから曲別WAVを生成する。
+実行前に保存イメージのハッシュ・サイズを検証する。
+
+```sh
+mise run split -- artifacts/rip-01 --output artifacts/wav-01
+```
+
+`track-01.wav`から曲順に出力する。44.1 kHz・16-bit・ステレオのPCMをそのままコピーし、
+音量変更・リサンプリング・ディエンファシス処理はしない。
+出力後は各WAVを読み直し、形式・PCM長・PCMのSHA-256が元のイメージと一致するか確かめる。
+確認が済むまでは`.part`で保持し、元のイメージと読み取り時のレポートは変更しない。
+
+区切りはINDEX 01から次のINDEX 01またはリードアウトまで。
+後続曲のプリギャップが前のファイル末尾に含まれる場合があり、INDEX 00単位の分割ではない。
+最初のINDEX 01がLBA 0より後にある場合は、その手前を`pregap.wav`として残す。
+負のLBAの音声は元のイメージに含まれず、復元しない。
+pre-emphasisはレポートに記録するだけなので、該当するCDのWAVは補正済みの鑑賞用音声ではない。
+
+WAV生成の成功は保存済みPCMを正確に切り出せたことを示し、CD読み取り品質の追加保証ではない。
+全曲比較・別条件での読み取りなどの検証は別途必要。
+
 ## 出力と結果の読み方
 
 出力先は毎回新しいディレクトリを指定する。既存のディレクトリや調査JSONは上書きしない。
@@ -109,12 +149,16 @@ probeは常に1セクター単位。ripは`--chunk-sectors`で1〜75セクター
 | `audio.bin` | ripで読み取りが一致したCDDA user data |
 | `disc.cue` | ripのイメージに対するINDEX 01中心の暫定CUE |
 | `samples.bin` / `sample-map.json` | probeのサンプルと元のLBA・保存位置の対応 |
+| `track-01.wav`など | splitで切り出し・読み直し確認が済んだ曲別WAV |
+| `pregap.wav` | 最初のINDEX 01より前にある非負LBAの音声。該当する場合のみ |
 
-`report.json`の`status: reads_matched`は反復読み取りの一致を示す。
+rip/probeの`report.json`の`status: reads_matched`は反復読み取りの一致を示す。
+compareは`pcm_matched`、splitは`wav_written`を正常終了時に記録する。
+それぞれ新しい出力先の`report.json`に、比較範囲や曲ごとのハッシュなどを保存する。
 `archival_verified`は常に`false`で、ビット完全な原本保存を保証する結果ではない。
 失敗・Ctrl-C時は`status: failed`として、途中の`.part`と取得済みの記録を残す。
 強制終了などで記録を更新できなかった場合は`running`のまま残る。
-終了コードは一致時が0、エラー時が1、中断時が130。
+終了コードは正常終了時が0、エラー時が1、中断時が130。
 この段階では途中再開に未対応なので、再試行には別の出力先を使う。
 
 ## 読み取り方式
@@ -134,7 +178,7 @@ LBAへの変換には150を引く。例えば`Start Block = 150`がLBA 0。
 macOSのcddafs実装に合わせ、音声を44.1 kHz・16-bit・ステレオのlittle-endian PCMとして扱う。
 cddafsの拡張子`.aiff`はAIFF-Cの`sowt`の場合があり、
 ヘッダーがbig-endianだから音声もbig-endianとは限らない。
-今後トラックファイルと比較する際も、固定バイト数のヘッダー除去ではなくSSNDを解析する。
+compareは固定バイト数のヘッダー除去ではなく、FORM・COMM・SSNDを解析する。
 
 ABIはApple SDKの`IOCDMediaBSDClient.h`・`IOCDTypes.h`・`sys/ioccom.h`を参照した。
 開発環境ではSDKから構造体サイズ・フィールド位置・ioctl定数を確認済み。
@@ -152,7 +196,9 @@ ABIはApple SDKの`IOCDMediaBSDClient.h`・`IOCDTypes.h`・`sys/ioccom.h`を参�
 
 今回の実機検証では、cddafsのAIFF-C形式・PCM長を全13曲で確認し、
 各曲の先頭・中央・末尾付近のPCMが保存イメージと一致した。
-次はcddafsとの全曲PCM比較、別チャンクサイズや再挿入後の比較、
+全曲PCM比較のCLIを追加済みだが、実CDでの全曲比較はまだ未確認。
+保存済みイメージからの全13曲のWAV生成と、出力PCMの一致は確認済み。
+次はCDを再挿入しての全曲PCM比較、別チャンクサイズでの比較、
 傷のあるCDでの失敗検知を行う。
 必要ならcdrdaoの取り込み結果とも比較する。
 読み取りが成立しても検証品質が足りなければ、Pythonのみの実装には固執しない。
@@ -168,6 +214,8 @@ mise run format    # フォーマットとlintの自動修正
 テストは実デバイスを開かない。
 TOC解析、ABI、2352バイト単位のオフセット、短い読み取り、再試行、パス間不一致、
 TOC変更、中断、上書き拒否を確認する。
+比較・WAV出力についても、AIFF-Cのヘッダー・オフセット・バイトオーダー、全バイト比較、
+入力のハッシュ検証、WAVの読み直し、プリギャップの保存、途中失敗をテストする。
 
 ## 参照
 

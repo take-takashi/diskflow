@@ -39,6 +39,46 @@ def test_empty_ioreg_output_means_no_media(monkeypatch):
     assert "error" in _plist_command(["/usr/sbin/diskutil"])
 
 
+def test_split_cli_never_opens_a_cd(captured, tmp_path, monkeypatch, capsys):
+    def no_cd(*_):
+        raise AssertionError("Offline extraction must not access a CD device")
+
+    monkeypatch.setattr("diskflow.cli.DarwinCD", no_cd)
+    output = tmp_path / "wav"
+    assert main(["split", str(captured[0]), "--output", str(output)]) == 0
+    assert "wav_written" in capsys.readouterr().out
+    assert (output / "track-01.wav").exists()
+
+
+def test_compare_cli_checks_all_pcm(captured, mounted, tmp_path, capsys):
+    output = tmp_path / "compare"
+    assert (
+        main(["compare", str(captured[0]), "--mount", str(mounted), "--output", str(output)]) == 0
+    )
+    report = json.loads((output / "report.json").read_text())
+    assert report["compared_bytes"] == len(captured[1])
+    assert "pcm_matched" in capsys.readouterr().out
+
+
+def test_compare_cli_with_no_cd_returns_error(captured, tmp_path, capsys):
+    output = tmp_path / "compare"
+    assert (
+        main(
+            [
+                "compare",
+                str(captured[0]),
+                "--mount",
+                str(tmp_path / "no-cd"),
+                "--output",
+                str(output),
+            ]
+        )
+        == 1
+    )
+    assert json.loads((output / "report.json").read_text())["status"] == "failed"
+    assert "error:" in capsys.readouterr().err
+
+
 def test_bad_device_does_not_open_anything(monkeypatch, tmp_path, capsys):
     monkeypatch.setattr("diskflow.darwin.sys.platform", "darwin")
     output = tmp_path / "probe"

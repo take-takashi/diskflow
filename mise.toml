@@ -23,6 +23,14 @@ run = "uv run --locked diskflow probe"
 description = "Read the audio image twice and compare every byte"
 run = "uv run --locked diskflow rip"
 
+[tasks.compare]
+description = "Compare all track PCM against a mounted cddafs CD"
+run = "uv run --locked diskflow compare"
+
+[tasks.split]
+description = "Extract verified track WAVs from a saved image without rereading the CD"
+run = "uv run --locked diskflow split"
+
 [tasks.test]
 run = "uv run --locked pytest"
 

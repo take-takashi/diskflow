@@ -6,10 +6,12 @@ import plistlib
 import subprocess
 import sys
 import time
+import wave
 from pathlib import Path
 
 from diskflow.archive import capture, now
 from diskflow.darwin import DarwinCD
+from diskflow.derived import compare_cddafs, split_wav
 from diskflow.toc import parse_toc
 
 
@@ -90,6 +92,15 @@ def _parser() -> argparse.ArgumentParser:
             command.add_argument(
                 "--chunk-sectors", type=int, default=16, help="Sectors per read (1..75)"
             )
+    for name, help_text in (
+        ("compare", "Compare every track's PCM with a mounted cddafs CD"),
+        ("split", "Extract lossless track WAVs from a completed image (no CD needed)"),
+    ):
+        command = commands.add_parser(name, help=help_text)
+        command.add_argument("capture", type=Path, help="Directory containing a completed rip")
+        command.add_argument("--output", required=True, type=Path, help="NEW output directory")
+        if name == "compare":
+            command.add_argument("--mount", required=True, type=Path, help="Mounted audio CD path")
     return parser
 
 
@@ -112,9 +123,22 @@ def main(argv: list[str] | None = None) -> int:
             nonlocal last_progress
             current = time.monotonic()
             if current - last_progress >= 5 or completed == total:
-                print(f"pass {pass_number}: {completed}/{total} sectors", file=sys.stderr)
+                label, unit = (
+                    ("track", "bytes")
+                    if args.command in ("compare", "split")
+                    else ("pass", "sectors")
+                )
+                print(f"{label} {pass_number}: {completed}/{total} {unit}", file=sys.stderr)
                 last_progress = current
 
+        if args.command in ("compare", "split"):
+            if args.command == "compare":
+                report = compare_cddafs(args.capture, args.mount, args.output, progress=progress)
+            else:
+                report = split_wav(args.capture, args.output, progress=progress)
+            print(f"{report['status']}: {args.output / 'report.json'}")
+            print("Original image is unchanged; archival accuracy is NOT yet verified.")
+            return 0
         with DarwinCD(args.device) as reader:
             report = capture(
                 reader,
@@ -132,8 +156,8 @@ def main(argv: list[str] | None = None) -> int:
     except KeyboardInterrupt:
         print("Interrupted; incomplete output is retained.", file=sys.stderr)
         return 130
-    except (OSError, ValueError, RuntimeError) as exc:
+    except (OSError, ValueError, RuntimeError, wave.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
-        if args.command in ("probe", "rip"):
+        if args.command in ("probe", "rip", "compare", "split"):
             print(f"If capture started, evidence is in {args.output}", file=sys.stderr)
         return 1
