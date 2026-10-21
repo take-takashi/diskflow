@@ -1,23 +1,28 @@
 # diskflow
 
 macOSで音楽CDをPythonから読み取れるか検証するPoC。
-CD読み取りの検証と、無加工の曲別WAV出力を対象とする。
-AAC変換・メタデータ取得・Notion連携はまだ扱わない。
+CD読み取りの検証、曲別WAV出力、曲単位の音量正規化、Apple AAC変換を対象とする。
+メタデータ取得・Notion連携はまだ扱わない。
 
 PIONEER BDR-TD05で13曲のCD全体を2回読み取り、全バイトの一致を確認済み。
 読み取り処理はPython標準ライブラリだけで動作した。ただし、原本保存品質は未検証。
 環境・実行結果・制約は[実機検証結果](docs/cd-reading-poc.md)を参照。
+全13曲のTrack GainとAAC化後の音量・True Peakも確認済み。
+詳しくは[音量正規化の検証](docs/loudness-poc.md)を参照。
 
 ## 環境管理
 
 - `mise.toml`でPython 3.14.5とuv 0.13.1を固定する。
 - uvで`.venv`とPythonパッケージを管理し、`uv.lock`をコミットする。
 - uvはmiseのPythonを使う。uvによる別のPythonのダウンロードは無効にする。
-- 読み取り処理の依存はPython標準ライブラリのみ。pytest・Ruffは開発用。
+- CD読み取りの実装はPython標準ライブラリのみ。PyAVは音量解析・ゲイン適用に使う。
+- PyAVもuvで管理する。wheel同梱のFFmpegライブラリを使い、FFmpeg CLIは起動しない。
+- pytest・Ruffは開発用。
 
 64-bit macOSとmiseが必要。Homebrewパッケージ、FFmpeg、cdrdao、コンパイラは
 読み取りコマンドの実行に不要。
 デバイスの調査にはmacOS標準の`diskutil`と`ioreg`を使う。
+AAC変換と出力確認には、同じくOS標準の`afconvert`と`afinfo`を使う。
 音声データは外部コマンドではなく、Pythonの`ctypes`と`fcntl.ioctl`で読み取る。
 
 ```sh
@@ -135,6 +140,55 @@ pre-emphasisはレポートに記録するだけなので、該当するCDのWAV
 WAV生成の成功は保存済みPCMを正確に切り出せたことを示し、CD読み取り品質の追加保証ではない。
 全曲比較・別条件での読み取りなどの検証は別途必要。
 
+### 6. 曲ごとに音量を正規化する
+
+```sh
+mise run normalize -- artifacts/wav-01 --output artifacts/normalized-01
+```
+
+既定値はIntegrated Loudness −14 LUFS、True Peak上限−1 dBTP。
+各曲をPyAVの`ebur128`で測定し、タグではなくPCM自体に曲ごとの固定ゲインを適用する。
+原本・無加工WAVは変更せず、新しい16-bit WAVを生成する。
+ゲイン変更時の再量子化にはTPDFディザを使う。曲内のコンプレッションやリミッターは使わない。
+
+ゲインはLUFS目標とピーク上限のうち厳しい方で決め、ピーク側には既定で0.05 dBの余裕を取る。
+**ピーク制約で−14 LUFSに届かない場合は、そのまま未達として記録する**。
+無音・短すぎる音声・ゲート以下の音声は無理に持ち上げない。
+出力を再計測してピーク上限を確認し、LUFSは±0.1 LUを目標到達の判定に使う。
+調整済みWAVの再正規化は拒否するので、条件を変える場合も無加工WAVから作り直す。
+
+`--target-lufs`、`--true-peak`、`--peak-headroom`で条件を変えられる。
+ピーク計測では100 ms未満の末尾が抜けないよう解析時だけ無音を補い、保存音声の長さは変えない。
+測定方法・丸め精度・適用ゲイン・到達状況は`report.json`に残す。
+
+### 7. 曲別WAVからAACを作る
+
+```sh
+mise run encode -- artifacts/normalized-01 --output artifacts/aac-normalized-01
+```
+
+正常終了したsplitまたはnormalizeの出力を入力にし、`afconvert`でApple AACのM4Aへ変換する。
+設定は256,000 bps・constrained VBR（strategy 2）・quality 127。
+[Apple公式のAAC変換例](https://www.apple.com/apple-music/apple-digital-masters/docs/apple-digital-masters.pdf)と
+主要設定が同じで、iTunes Plus相当の設定。ただしMusic.app出力とのバイト一致は未検証。
+CVBRなので平均ビットレートは256,000 bps固定ではない。
+
+入力WAVの形式・ハッシュを確認し、変換後は`afinfo`でAAC/M4A・44.1 kHz・2チャンネル・
+有効フレーム数を調べる。正規化済みWAVが入力なら、AACを最後までfloat32 CAFへデコードし、
+LUFS・True Peakを再計測する。整数デコードでピーク超過を隠さず、−1 dBTPなどの指定上限を
+超える場合は失敗とする。その場合は無加工WAVから`--peak-headroom`を増やしてやり直す。
+
+無加工のsplit出力を直接encodeすることもできるが、それは音量未調整の検証用AAC。
+この場合は整数WAVへの全体デコードとフレーム数の確認までで、True Peakは検証しない。
+AACは非可逆圧縮なので、デコードしたPCMと元PCMのハッシュ一致は要求しない。
+ツールの実行条件・結果は`commands.jsonl`に残し、正常時に一時デコードファイルを削除して
+確認済みの`.m4a.part`を`.m4a`へ変更する。
+
+曲名・ジャケットの設定は未実装。pre-emphasisが有効または不明の曲は、補正処理ができるまで
+normalize/encodeを拒否する。`pregap.wav`は処理対象外として記録し、元WAV側に保持する。
+条件変更時もイメージ・無加工WAVから再生成し、既存AACを再エンコードしない。
+実行結果は[AAC変換の検証](docs/aac-poc.md)と[音量正規化の検証](docs/loudness-poc.md)を参照。
+
 ## 出力と結果の読み方
 
 出力先は毎回新しいディレクトリを指定する。既存のディレクトリや調査JSONは上書きしない。
@@ -149,11 +203,16 @@ WAV生成の成功は保存済みPCMを正確に切り出せたことを示し�
 | `audio.bin` | ripで読み取りが一致したCDDA user data |
 | `disc.cue` | ripのイメージに対するINDEX 01中心の暫定CUE |
 | `samples.bin` / `sample-map.json` | probeのサンプルと元のLBA・保存位置の対応 |
-| `track-01.wav`など | splitで切り出し・読み直し確認が済んだ曲別WAV |
+| `track-01.wav`など | splitの無加工WAV、またはnormalizeの音量調整済みWAV。出力先は別々 |
 | `pregap.wav` | 最初のINDEX 01より前にある非負LBAの音声。該当する場合のみ |
+| `track-01.m4a`など | encodeのAAC。音量調整の有無は入力とレポートで区別する。曲情報は未設定 |
+| `commands.jsonl` | encodeで使用したOS標準ツールの実行条件と結果 |
 
 rip/probeの`report.json`の`status: reads_matched`は反復読み取りの一致を示す。
-compareは`pcm_matched`、splitは`wav_written`を正常終了時に記録する。
+compareは`pcm_matched`、splitは`wav_written`、normalizeは`normalized`、encodeは`aac_encoded`を記録する。
+正規化は`loudness_normalized`、全曲のLUFS目標到達は`all_targets_reached`で区別する。
+`normalized`はピーク優先ポリシーを適用できたことを示し、全曲のLUFS到達までは意味しない。
+`aac_encoded`だけで、正規化や音質評価まで完了したと判断しない。
 それぞれ新しい出力先の`report.json`に、比較範囲や曲ごとのハッシュなどを保存する。
 `archival_verified`は常に`false`で、ビット完全な原本保存を保証する結果ではない。
 失敗・Ctrl-C時は`status: failed`として、途中の`.part`と取得済みの記録を残す。
@@ -207,7 +266,7 @@ ABIはApple SDKの`IOCDMediaBSDClient.h`・`IOCDTypes.h`・`sys/ioccom.h`を参�
 ## 開発
 
 ```sh
-mise run check     # モックを使ったテスト、lint、フォーマット確認
+mise run check     # 短い合成音声/モックによるテスト、lint、フォーマット確認
 mise run format    # フォーマットとlintの自動修正
 ```
 
@@ -216,6 +275,10 @@ TOC解析、ABI、2352バイト単位のオフセット、短い読み取り、�
 TOC変更、中断、上書き拒否を確認する。
 比較・WAV出力についても、AIFF-Cのヘッダー・オフセット・バイトオーダー、全バイト比較、
 入力のハッシュ検証、WAVの読み直し、プリギャップの保存、途中失敗をテストする。
+AAC変換のテストではOSツールをモックし、コマンド条件・エラー・タイムアウト、
+コーデック・有効フレーム数・priming/padding、元WAVの保護を確認する。
+音量処理は実際のPyAVで合成音を処理し、固定ゲイン、ピーク制約、末尾ピーク、無音、
+フレーム数の維持、入力保護、AAC化後のピーク超過の拒否を確認する。
 
 ## 参照
 

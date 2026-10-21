@@ -9,6 +9,7 @@ import time
 import wave
 from pathlib import Path
 
+from diskflow.aac import encode_aac
 from diskflow.archive import capture, now
 from diskflow.darwin import DarwinCD
 from diskflow.derived import compare_cddafs, split_wav
@@ -101,6 +102,27 @@ def _parser() -> argparse.ArgumentParser:
         command.add_argument("--output", required=True, type=Path, help="NEW output directory")
         if name == "compare":
             command.add_argument("--mount", required=True, type=Path, help="Mounted audio CD path")
+    normalization = commands.add_parser(
+        "normalize", help="Per-track fixed gain, limited by true peak"
+    )
+    normalization.add_argument(
+        "wavs", type=Path, help="Directory containing an ORIGINAL split output"
+    )
+    normalization.add_argument("--output", required=True, type=Path, help="NEW output directory")
+    normalization.add_argument(
+        "--target-lufs", type=float, help="Integrated LUFS target (default -14)"
+    )
+    normalization.add_argument(
+        "--true-peak", type=float, help="True peak ceiling in dBTP (default -1)"
+    )
+    normalization.add_argument(
+        "--peak-headroom",
+        type=float,
+        help="Extra WAV peak headroom in dB (default 0.05); increase if AAC overshoots",
+    )
+    encoding = commands.add_parser("encode", help="Apple AAC 256 kbps from verified WAVs (no tags)")
+    encoding.add_argument("wavs", type=Path, help="Directory containing split or normalized WAVs")
+    encoding.add_argument("--output", required=True, type=Path, help="NEW output directory")
     return parser
 
 
@@ -123,14 +145,49 @@ def main(argv: list[str] | None = None) -> int:
             nonlocal last_progress
             current = time.monotonic()
             if current - last_progress >= 5 or completed == total:
-                label, unit = (
-                    ("track", "bytes")
-                    if args.command in ("compare", "split")
-                    else ("pass", "sectors")
-                )
+                if args.command in ("encode", "normalize"):
+                    label, unit = "track", "frames"
+                elif args.command in ("compare", "split"):
+                    label, unit = "track", "bytes"
+                else:
+                    label, unit = "pass", "sectors"
                 print(f"{label} {pass_number}: {completed}/{total} {unit}", file=sys.stderr)
                 last_progress = current
 
+        if args.command == "normalize":
+            # Do not import the optional-to-reading native audio backend for CD-only commands.
+            from diskflow.normalize import normalize_wavs
+
+            options = {
+                key: value
+                for key, value in (
+                    ("target_lufs", args.target_lufs),
+                    ("true_peak_dbtp", args.true_peak),
+                    ("peak_headroom_db", args.peak_headroom),
+                )
+                if value is not None
+            }
+            report = normalize_wavs(args.wavs, args.output, progress=progress, **options)
+            print(f"{report['status']}: {args.output / 'report.json'}")
+            unmet = sum(not track["target_reached"] for track in report["tracks"])
+            print(
+                f"Fixed Track Gain applied; {unmet} track(s) did not reach the LUFS target. "
+                "No limiter/compression; original WAVs are unchanged."
+            )
+            return 0
+        if args.command == "encode":
+            report = encode_aac(args.wavs, args.output, progress=progress)
+            print(f"{report['status']}: {args.output / 'report.json'}")
+            if report["loudness_normalized"]:
+                print(
+                    "Normalized WAVs encoded; decoded AAC true peak checked. Metadata tags not set."
+                )
+            else:
+                print(
+                    "AAC baseline only; loudness normalization and metadata tagging "
+                    "are NOT applied."
+                )
+            return 0
         if args.command in ("compare", "split"):
             if args.command == "compare":
                 report = compare_cddafs(args.capture, args.mount, args.output, progress=progress)
@@ -158,6 +215,6 @@ def main(argv: list[str] | None = None) -> int:
         return 130
     except (OSError, ValueError, RuntimeError, wave.Error) as exc:
         print(f"error: {exc}", file=sys.stderr)
-        if args.command in ("probe", "rip", "compare", "split"):
+        if args.command in ("probe", "rip", "compare", "split", "normalize", "encode"):
             print(f"If capture started, evidence is in {args.output}", file=sys.stderr)
         return 1

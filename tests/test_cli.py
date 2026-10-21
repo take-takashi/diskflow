@@ -1,6 +1,7 @@
 import json
 import plistlib
 import subprocess
+import sys
 
 from diskflow.cli import _plist_command, inspect_mount, main
 
@@ -77,6 +78,20 @@ def test_compare_cli_with_no_cd_returns_error(captured, tmp_path, capsys):
     )
     assert json.loads((output / "report.json").read_text())["status"] == "failed"
     assert "error:" in capsys.readouterr().err
+
+
+def test_cd_cli_and_help_do_not_import_pyav():
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys; from diskflow.cli import _parser; "
+            "_parser(); assert 'av' not in sys.modules",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 def test_bad_device_does_not_open_anything(monkeypatch, tmp_path, capsys):

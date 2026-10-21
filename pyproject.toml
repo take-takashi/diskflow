@@ -1,10 +1,12 @@
 [project]
 name = "diskflow"
 version = "0.1.0"
-description = "A standard-library-only macOS audio CD reading experiment"
+description = "macOS audio CD capture, peak-limited normalization, and Apple AAC experiments"
 readme = "README.md"
 requires-python = ">=3.14"
-dependencies = []
+dependencies = [
+    "av>=18.1.0,<19",
+]
 
 [project.scripts]
 diskflow = "diskflow.cli:main"

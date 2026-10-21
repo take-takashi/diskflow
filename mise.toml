@@ -31,6 +31,14 @@ run = "uv run --locked diskflow compare"
 description = "Extract verified track WAVs from a saved image without rereading the CD"
 run = "uv run --locked diskflow split"
 
+[tasks.normalize]
+description = "Apply peak-limited Track Gain to new WAVs (-14 LUFS / -1 dBTP by default)"
+run = "uv run --locked diskflow normalize"
+
+[tasks.encode]
+description = "Encode verified raw/normalized WAVs with Apple AAC and validate decoded audio"
+run = "uv run --locked diskflow encode"
+
 [tasks.test]
 run = "uv run --locked pytest"
 

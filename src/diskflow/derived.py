@@ -21,7 +21,7 @@ Progress = Callable[[int, int, int], None]
 
 
 @contextmanager
-def _report(output: Path, operation: str, source: Path):
+def operation_report(output: Path, operation: str, source: Path):
     output.mkdir(parents=True, exist_ok=False)
     path = output / "report.json"
     report = {
@@ -103,7 +103,7 @@ def compare_cddafs(
     *,
     progress: Progress | None = None,
 ) -> dict:
-    with _report(output, "compare", directory) as report:
+    with operation_report(output, "compare", directory) as report:
         image = SavedImage.load(directory)
         _source_details(report, image)
         mount = mount.resolve()
@@ -197,7 +197,7 @@ def _verify_wav(path: Path, frames: int, expected_sha256: str) -> None:
 
 
 def split_wav(directory: Path, output: Path, *, progress: Progress | None = None) -> dict:
-    with _report(output, "split", directory) as report:
+    with operation_report(output, "split", directory) as report:
         image = SavedImage.load(directory)
         _source_details(report, image)
         report.update(

@@ -124,3 +124,12 @@ def make_mount(make_aiff):
 @pytest.fixture
 def mounted(make_mount, captured, tmp_path):
     return make_mount(tmp_path / "mount", captured)
+
+
+@pytest.fixture
+def wavs(captured, tmp_path):
+    from diskflow.derived import split_wav
+
+    output = tmp_path / "wavs"
+    split_wav(captured[0], output)
+    return output
