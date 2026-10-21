@@ -1,14 +1,21 @@
 # diskflow
 
-macOSで音楽CDをPythonから読み取れるか検証するPoC。
+macOSで音楽CDを読み取り、原本イメージ・検証記録・鑑賞用音声をローカル保存するCLIツール。
 CD読み取りの検証、曲別WAV出力、曲単位の音量正規化、Apple AAC変換を対象とする。
-メタデータ取得・Notion連携はまだ扱わない。
+MusicBrainz/Apple配信情報からの曲名・ジャケット取得と、再エンコードなしのM4Aタグ付けにも対応する。
 
 PIONEER BDR-TD05で13曲のCD全体を2回読み取り、全バイトの一致を確認済み。
 読み取り処理はPython標準ライブラリだけで動作した。ただし、原本保存品質は未検証。
 環境・実行結果・制約は[実機検証結果](docs/cd-reading-poc.md)を参照。
 全13曲のTrack GainとAAC化後の音量・True Peakも確認済み。
 詳しくは[音量正規化の検証](docs/loudness-poc.md)を参照。
+
+## 責務の範囲
+
+`diskflow`はCDの読み取りと、ローカルでの検証・音声処理・タグ付けまでを担当する。
+Notionへのアップロードやページの作成・更新は`shortcuts_app`側で扱い、このリポジトリには実装しない。
+呼び出し側は出力された音声・画像と`report.json`・`album.json`を利用する。
+`diskflow`はNotionの認証情報やAPIに依存しない。
 
 ## 環境管理
 
@@ -17,6 +24,7 @@ PIONEER BDR-TD05で13曲のCD全体を2回読み取り、全バイトの一致�
 - uvはmiseのPythonを使う。uvによる別のPythonのダウンロードは無効にする。
 - CD読み取りの実装はPython標準ライブラリのみ。PyAVは音量解析・ゲイン適用に使う。
 - PyAVもuvで管理する。wheel同梱のFFmpegライブラリを使い、FFmpeg CLIは起動しない。
+- タグ編集はmutagen、画像検証はPillowを使う。どちらもuvで管理する。
 - pytest・Ruffは開発用。
 
 64-bit macOSとmiseが必要。Homebrewパッケージ、FFmpeg、cdrdao、コンパイラは
@@ -33,6 +41,25 @@ mise run check
 ```
 
 以降のコマンドも`mise run`で実行する。直接uvを呼ぶ場合は`mise exec -- uv ...`を使う。
+
+## コマンド構成
+
+| 用途 | コマンド |
+| --- | --- |
+| デバイス・CD構造の確認 | `inspect` |
+| 読み取り試験・原本イメージ保存 | `probe` / `rip` |
+| 保存イメージと実CDのPCM比較 | `compare` |
+| ローカルの音声出力・加工 | `split` / `normalize` / `encode` |
+| 曲情報・画像の取得とタグ設定 | `metadata` / `tag` |
+
+全体のヘルプは次のコマンドで確認できる。各サブコマンドも`--help`に対応する。
+
+```sh
+mise exec -- uv run --locked diskflow --help
+```
+
+現在は工程ごとのコマンドを個別に実行する。一括実行と途中再開のコマンドは未対応。
+今後は外部サービスへの連携ではなく、CD取り込みからローカル出力までのコマンド整備を優先する。
 
 ## 実機での検証手順
 
@@ -184,10 +211,71 @@ AACは非可逆圧縮なので、デコードしたPCMと元PCMのハッシュ�
 ツールの実行条件・結果は`commands.jsonl`に残し、正常時に一時デコードファイルを削除して
 確認済みの`.m4a.part`を`.m4a`へ変更する。
 
-曲名・ジャケットの設定は未実装。pre-emphasisが有効または不明の曲は、補正処理ができるまで
-normalize/encodeを拒否する。`pregap.wav`は処理対象外として記録し、元WAV側に保持する。
+pre-emphasisが有効または不明の曲は、補正処理ができるまでnormalize/encodeを拒否する。`pregap.wav`は処理対象外として記録し、元WAV側に保持する。
 条件変更時もイメージ・無加工WAVから再生成し、既存AACを再エンコードしない。
 実行結果は[AAC変換の検証](docs/aac-poc.md)と[音量正規化の検証](docs/loudness-poc.md)を参照。
+
+### 8. 曲情報とジャケットを取得する
+
+```sh
+mise run metadata -- artifacts/rip-01 --output artifacts/metadata-01
+```
+
+TOCから標準ライブラリでMusicBrainz Disc IDを計算し、対応するリリースを照合する。
+候補が複数あるときは勝手に選ばず、`candidates.json`を確認して`--release-id`で選択する。
+ジャケットは選択したリリースのCover Art Archiveから取得する。
+MusicBrainzへの問い合わせはUser-Agentを設定し、同じクライアント内で1.1秒以上の間隔を取る。
+
+未登録CDでは、確認済みのAppleアルバムIDを明示するフォールバックがある。
+
+```sh
+mise run metadata -- artifacts/rip-01 --apple-album-id 6813318544 --output artifacts/metadata-02
+```
+
+このIDは今回のaikoのアルバム用であり、別CDに流用しない。
+曲数・曲順・各曲の時間をTOCと比較し、時間差が2秒を超える場合は拒否する。
+Appleの情報は配信版として記録し、物理CDの通常盤/初回盤やプレスを特定したとは扱わない。
+出典URL・生のAPI応答・取得日時・画像ハッシュ・寸法・時間差を出力先に残す。
+画像はJPEG/PNG、8 MiB以下、1600万画素以下に制限して検証する。
+
+#### 初回盤などのジャケットを指定する
+
+曲情報の取得元とは別に、使いたい画像と版のラベルを指定できる。
+用意した画像を使う場合は、次のように実行する。
+
+```sh
+mise run metadata -- artifacts/rip-01 --apple-album-id 6813318544 \
+  --edition "初回限定盤" --artwork ./covers/limited.jpg \
+  --output artifacts/metadata-limited-01
+```
+
+`--artwork`の代わりに`--artwork-url HTTPSの画像URL`も使える。両方の同時指定はできない。
+`--edition`は任意のラベルで、画像の自動検索・版の自動判定をするフラグではない。
+`--edition`だけの指定は拒否し、画像の取得や検証に失敗しても配信版などへ切り替えない。
+TOC/Disc IDでは、同じ音楽CDを同梱した通常盤・初回盤のパッケージを区別できないためである。
+
+曲情報の出典はそのまま保持し、版のラベルはユーザー指定として別に記録する。
+画像の出典・選択方法・ハッシュも`album.json`とM4Aの独自タグに保存する。
+ローカル画像の絶対パスは`report.json`だけに残し、M4Aには埋め込まない。
+次のtagには、ここで作った`metadata-limited-01`を指定する。
+
+### 9. 曲名とジャケットをAACへ埋め込む
+
+```sh
+mise run tag -- artifacts/aac-normalized-01 --metadata artifacts/metadata-02 --output artifacts/tagged-01
+```
+
+元AACをコピーして、mutagenで曲名・アーティスト・アルバム名・アルバムアーティスト・日付・
+曲番号・ディスク番号・ジャケットなどを設定する。ファイル名も`01 曲名.m4a`の形にする。
+元AACは変更せず、元のエンコーダー情報やgapless情報を含む未知のタグは消去しない。
+
+タグ付け前後でAACの全パケット、コーデック設定、PTS/DTS・duration・time baseを比較する。
+それらが同じであることを確かめてから確定名にするので、音声の再エンコードは行わない。
+保存時のレポートのハッシュ連鎖をたどり、メタデータのTOCハッシュ・曲ごとのフレーム数が
+このAACの取得元CDと一致することも確認する。参照先の`report.json`は削除せず残しておく。
+タグとジャケットは保存後に再読し、値と画像バイト列の一致を確認する。
+音量の計測値はパケット不変の確認を根拠に親レポートから引き継ぎ、再計測とは区別して記録する。
+実行結果・配信版から初回盤ジャケットへの差し替えは[メタデータ設定の検証](docs/metadata-poc.md)を参照。
 
 ## 出力と結果の読み方
 
@@ -205,13 +293,17 @@ normalize/encodeを拒否する。`pregap.wav`は処理対象外として記録�
 | `samples.bin` / `sample-map.json` | probeのサンプルと元のLBA・保存位置の対応 |
 | `track-01.wav`など | splitの無加工WAV、またはnormalizeの音量調整済みWAV。出力先は別々 |
 | `pregap.wav` | 最初のINDEX 01より前にある非負LBAの音声。該当する場合のみ |
-| `track-01.m4a`など | encodeのAAC。音量調整の有無は入力とレポートで区別する。曲情報は未設定 |
+| `track-01.m4a`など | encodeのAAC。音量調整の有無は入力とレポートで区別する |
+| `album.json` / `cover.jpg`など | 取得したアルバム・曲情報、出典、検証済みジャケット |
+| `requests.jsonl` / `candidates.json` | メタデータ問い合わせの結果、MusicBrainzの候補 |
+| `01 曲名.m4a`など | tagで曲情報・ジャケットを埋め込んだAAC |
 | `commands.jsonl` | encodeで使用したOS標準ツールの実行条件と結果 |
 
 rip/probeの`report.json`の`status: reads_matched`は反復読み取りの一致を示す。
 compareは`pcm_matched`、splitは`wav_written`、normalizeは`normalized`、encodeは`aac_encoded`を記録する。
 正規化は`loudness_normalized`、全曲のLUFS目標到達は`all_targets_reached`で区別する。
 `normalized`はピーク優先ポリシーを適用できたことを示し、全曲のLUFS到達までは意味しない。
+メタデータ取得は`metadata_ready`、タグ付けは`tagged`で正常終了する。
 `aac_encoded`だけで、正規化や音質評価まで完了したと判断しない。
 それぞれ新しい出力先の`report.json`に、比較範囲や曲ごとのハッシュなどを保存する。
 `archival_verified`は常に`false`で、ビット完全な原本保存を保証する結果ではない。
@@ -279,6 +371,8 @@ AAC変換のテストではOSツールをモックし、コマンド条件・エ
 コーデック・有効フレーム数・priming/padding、元WAVの保護を確認する。
 音量処理は実際のPyAVで合成音を処理し、固定ゲイン、ピーク制約、末尾ピーク、無音、
 フレーム数の維持、入力保護、AAC化後のピーク超過の拒否を確認する。
+メタデータのネットワークはモックし、Disc ID、候補選択、時間照合、画像の検証を行う。
+タグ付けは短いAACをPython内で生成し、タグ・画像の再読、パケット/時刻情報の不変、入力保護を確認する。
 
 ## 参照
 

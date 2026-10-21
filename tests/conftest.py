@@ -133,3 +133,156 @@ def wavs(captured, tmp_path):
     output = tmp_path / "wavs"
     split_wav(captured[0], output)
     return output
+
+
+@pytest.fixture
+def cover_bytes():
+    import io
+
+    from PIL import Image
+
+    buffer = io.BytesIO()
+    Image.new("RGB", (32, 32), (40, 80, 120)).save(buffer, "JPEG")
+    return buffer.getvalue()
+
+
+@pytest.fixture
+def fake_metadata(monkeypatch, cover_bytes, captured):
+    from types import SimpleNamespace
+
+    from diskflow.metadata import MetadataClient, disc_id
+
+    identifier = disc_id(parse_toc((captured[0] / "toc.bin").read_bytes()))
+    release_id = "11111111-1111-4111-8111-111111111111"
+    state = SimpleNamespace(
+        calls=[],
+        cover=cover_bytes,
+        apple={
+            "results": [
+                {
+                    "wrapperType": "collection",
+                    "collectionId": 123,
+                    "collectionName": "テストアルバム",
+                    "artistName": "aiko",
+                    "trackCount": 2,
+                    "releaseDate": "2026-10-21T07:00:00Z",
+                    "primaryGenreName": "J-Pop",
+                    "copyright": "℗ Test",
+                    "collectionViewUrl": "https://music.apple.com/jp/album/123",
+                    "artworkUrl100": "https://is1-ssl.mzstatic.com/image/thumb/test/100x100bb.jpg",
+                },
+                *[
+                    {
+                        "wrapperType": "track",
+                        "collectionId": 123,
+                        "trackId": 1000 + n,
+                        "trackNumber": n,
+                        "discNumber": 1,
+                        "discCount": 1,
+                        "trackName": title,
+                        "artistName": "aiko",
+                        "trackTimeMillis": length,
+                    }
+                    for n, title, length in [(1, "君の言う通り", 67), (2, "淡い", 80)]
+                ],
+            ]
+        },
+        mb_disc={"id": identifier, "releases": [{"id": release_id, "title": "テストアルバム"}]},
+        mb_release={
+            "id": release_id,
+            "title": "テストアルバム",
+            "date": "2026-10-21",
+            "artist-credit": [{"name": "aiko"}],
+            "media": [
+                {
+                    "position": 1,
+                    "discs": [{"id": identifier}],
+                    "tracks": [
+                        {"position": 1, "title": "君の言う通り", "length": 67},
+                        {"position": 2, "title": "淡い", "length": 80},
+                    ],
+                }
+            ],
+        },
+    )
+
+    def get(self, url, name, *, image=False):
+        state.calls.append(url)
+        if image:
+            data = state.cover
+        else:
+            data = json.dumps(
+                state.apple
+                if "itunes.apple.com" in url
+                else state.mb_disc
+                if "/discid/" in url
+                else state.mb_release
+            ).encode()
+        (self.output / name).write_bytes(data)
+        return data
+
+    monkeypatch.setattr(MetadataClient, "get", get)
+    return state
+
+
+@pytest.fixture
+def album_metadata(captured, fake_metadata, tmp_path):
+    from diskflow.metadata import fetch_metadata
+
+    output = tmp_path / "metadata"
+    fetch_metadata(captured[0], output, apple_album_id=123)
+    return output
+
+
+@pytest.fixture
+def encoded_wavs(wavs, tmp_path):
+    import av
+    from mutagen.mp4 import MP4
+
+    from diskflow.image import file_sha256
+
+    manifest = json.loads((wavs / "report.json").read_text())
+    output = tmp_path / "aac"
+    output.mkdir()
+    tracks = []
+    for entry in manifest["tracks"]:
+        path = output / f"track-{entry['number']:02}.m4a"
+        with (
+            av.open(str(wavs / entry["file"])) as source,
+            av.open(str(path), "w", format="mp4") as dest,
+        ):
+            stream = dest.add_stream("aac", rate=44100)
+            stream.layout = "stereo"
+            stream.bit_rate = 128000
+            resampler = av.AudioResampler(format="fltp", layout="stereo", rate=44100)
+            for frame in source.decode(audio=0):
+                for reformatted in resampler.resample(frame):
+                    for packet in stream.encode(reformatted):
+                        dest.mux(packet)
+            for frame in resampler.resample(None):
+                for packet in stream.encode(frame):
+                    dest.mux(packet)
+            for packet in stream.encode(None):
+                dest.mux(packet)
+        audio = MP4(path)
+        audio["----:com.apple.iTunes:keep_me"] = [b"preserve unrelated tags"]
+        audio.save()
+        tracks.append(
+            {
+                "number": entry["number"],
+                "status": "complete",
+                "file": path.name,
+                "source_frames": entry["frames"],
+                "sha256": file_sha256(path),
+            }
+        )
+    report = {
+        "operation": "encode",
+        "status": "aac_encoded",
+        "tracks": tracks,
+        "source_directory": str(wavs.resolve()),
+        "source_manifest_sha256": file_sha256(wavs / "report.json"),
+        "loudness_normalized": False,
+    }
+    (output / "report.json").write_text(json.dumps(report))
+    return output

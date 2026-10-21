@@ -3,6 +3,8 @@ import plistlib
 import subprocess
 import sys
 
+import pytest
+
 from diskflow.cli import _plist_command, inspect_mount, main
 
 
@@ -100,3 +102,13 @@ def test_bad_device_does_not_open_anything(monkeypatch, tmp_path, capsys):
     assert main(["probe", "/dev/disk0", "--output", str(output)]) == 1
     assert "whole raw CD device" in capsys.readouterr().err
     assert not output.exists()
+
+
+def test_help_describes_local_cd_tool_scope(capsys):
+    with pytest.raises(SystemExit) as exit_info:
+        main(["--help"])
+    assert exit_info.value.code == 0
+    text = " ".join(capsys.readouterr().out.split())
+    assert "local WAV/AAC preparation" in text
+    assert "Uploads belong in the calling application" in text
+    assert "Python standard library" not in text

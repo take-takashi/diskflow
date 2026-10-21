@@ -100,5 +100,7 @@ Appleの`afconvert`でAACをfloat32 CAFへ全体デコードし、その波形�
 - `artifacts/aac-normalized-20261021-135108/`：音量調整済みAAC、`report.json`、`commands.jsonl`
 
 ファイル名は各フォルダとも`track-01`〜`track-13`。音声・端末固有ログはGit管理対象外。
-pre-emphasisの補正、曲名・ジャケット取得、Notionアップロードは引き続き未実装。
+pre-emphasisの補正は引き続き未実装。
+Notion連携は`shortcuts_app`側で扱い、`diskflow`の実装範囲には含めない。
+曲名・ジャケットの取得と埋め込みは追加済みで、[メタデータ設定の検証](metadata-poc.md)に記録した。
 実CDとの全曲PCM比較など、読み取り側の追加検証も残っている。
