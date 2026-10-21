@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+#MISE description="CD取り込みからタグ付きAACまで一括実行し、指定フォルダへ保存"
+#MISE quiet=true
+#USAGE flag "--device <device>" help="取り込む音楽CDのrawデバイス（--captureとどちらか一方）"
+#USAGE flag "--capture <dir>" help="保存済みripのフォルダ（CDを再読み取りせずコピー、--deviceとどちらか一方）"
+#USAGE flag "-o --output <dir>" required=#true help="CDごとの新しい出力フォルダ（既存フォルダは上書きしない）"
+#USAGE flag "--artwork <file>" required=#true help="埋め込むカバー画像（JPEG/PNG）"
+#USAGE flag "--edition <label>" help="版の記録用ラベル（例: 初回限定盤）"
+#USAGE flag "--apple-album-id <id>" help="MusicBrainzの代わりに使うAppleアルバムID（--release-idと併用不可）"
+#USAGE flag "--release-id <id>" help="MusicBrainzのリリースID（候補の選択用）"
+#USAGE flag "--passes <count>" default="2" help="CDの読み取り回数（2以上、--device使用時）"
+#USAGE flag "--retries <count>" default="2" help="読み取りエラー時の追加試行回数（--device使用時）"
+#USAGE flag "--chunk-sectors <count>" default="16" help="1回に読むセクター数（1〜75、--device使用時）"
+#USAGE flag "--target-lufs <lufs>" default="-14" help="曲別の音量目標（例: --target-lufs=-14）"
+#USAGE flag "--true-peak <dbtp>" default="-1" help="True Peakの上限（例: --true-peak=-1）"
+#USAGE flag "--peak-headroom <db>" default="0.05" help="正規化WAVに確保する追加のピーク余裕（dB）"
+
+set -euo pipefail
+exec uv run --locked python -m diskflow.workflow
