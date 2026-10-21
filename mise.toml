@@ -8,53 +8,57 @@ UV_PYTHON = "python"
 UV_PYTHON_DOWNLOADS = "never"
 
 [tasks.setup]
-description = "Install locked Python dependencies"
+description = "ロックファイルに従ってPythonの依存パッケージをインストール"
 run = "uv sync --locked"
 
 [tasks.inspect]
-description = "Inspect mounted audio CDs and macOS disk information"
+description = "マウント済み音楽CDとmacOSのディスク情報を確認"
 run = "uv run --locked diskflow inspect"
 
 [tasks.probe]
-description = "Read a few CDDA sectors twice (requires an explicit device)"
+description = "CDの一部を2回以上読み取って比較（デバイス指定必須）"
 run = "uv run --locked diskflow probe"
 
 [tasks.rip]
-description = "Read the audio image twice and compare every byte"
+description = "音楽CDを2回以上読み取り、全バイトを比較してイメージを保存"
 run = "uv run --locked diskflow rip"
 
 [tasks.compare]
-description = "Compare all track PCM against a mounted cddafs CD"
+description = "保存イメージとマウント済みCDの全曲PCMを比較"
 run = "uv run --locked diskflow compare"
 
 [tasks.split]
-description = "Extract verified track WAVs from a saved image without rereading the CD"
+description = "保存イメージから曲別WAVを切り出して検証（CDの再読み取り不要）"
 run = "uv run --locked diskflow split"
 
 [tasks.normalize]
-description = "Apply peak-limited Track Gain to new WAVs (-14 LUFS / -1 dBTP by default)"
+description = "曲別の固定ゲインを適用したWAVを生成（既定: -14 LUFS / -1 dBTP、ピーク優先）"
 run = "uv run --locked diskflow normalize"
 
 [tasks.encode]
-description = "Encode verified raw/normalized WAVs with Apple AAC and validate decoded audio"
+description = "検証済みWAVをApple AACへ変換し、デコード結果を検証"
 run = "uv run --locked diskflow encode"
 
 [tasks.metadata]
-description = "Fetch album/cover metadata by Disc ID or an explicit Apple album ID"
+description = "Disc IDまたは指定したAppleアルバムIDから曲情報・ジャケットを取得"
 run = "uv run --locked diskflow metadata"
 
 [tasks.tag]
-description = "Embed album tags and cover into copied M4As without re-encoding"
+description = "M4Aのコピーへ曲情報・ジャケットを設定（再エンコードなし）"
 run = "uv run --locked diskflow tag"
 
 [tasks.test]
+description = "pytestでテストを実行"
 run = "uv run --locked pytest"
 
 [tasks.lint]
+description = "Ruffで静的解析とフォーマットを確認"
 run = "uv run --locked ruff check . && uv run --locked ruff format --check ."
 
 [tasks.format]
+description = "Ruffでコードを整形し、修正可能な指摘を自動修正"
 run = "uv run --locked ruff format . && uv run --locked ruff check --fix ."
 
 [tasks.check]
+description = "テスト・静的解析・フォーマット確認をまとめて実行"
 depends = ["lint", "test"]
