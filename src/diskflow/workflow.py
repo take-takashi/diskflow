@@ -1,5 +1,6 @@
-"""Local album workflow, invoked by the mise import task through Usage variables."""
+"""User-facing CD import: discover inputs, retain capture plus finished AAC only."""
 
+import hashlib
 import json
 import math
 import os
@@ -9,12 +10,14 @@ import sys
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from datetime import datetime
 from pathlib import Path
 
 from diskflow.aac import encode_aac
 from diskflow.archive import capture, now, write_json
 from diskflow.darwin import MAX_READ_SECTORS, DarwinCD
 from diskflow.derived import split_wav
+from diskflow.discovery import Chooser, discover_cd
 from diskflow.image import SavedImage, file_sha256
 from diskflow.metadata import MAX_COVER_BYTES, _text, cover_info, fetch_metadata
 from diskflow.normalize import (
@@ -23,17 +26,25 @@ from diskflow.normalize import (
     DEFAULT_TRUE_PEAK_DBTP,
     normalize_wavs,
 )
+from diskflow.reproduction import (
+    METADATA_FILES,
+    cached_metadata,
+    read_recipe,
+    resolve_capture,
+    reuse_metadata,
+    validate_cache,
+    write_recipe,
+)
 from diskflow.tagging import tag_album
 
-# Only archive files produced by rip are imported; unrelated files are not copied.
 CAPTURE_FILES = ("audio.bin", "toc.bin", "report.json", "toc.json", "disc.cue", "reads.jsonl")
 STAGES = (
     ("capture", "capture", "reads_matched"),
-    ("metadata", "metadata", "metadata_ready"),
-    ("split", "wav", "wav_written"),
-    ("normalize", "normalized", "normalized"),
-    ("encode", "aac", "aac_encoded"),
-    ("tag", "tagged", "tagged"),
+    ("metadata", "capture/metadata", "metadata_ready"),
+    ("split", "logs/split", "wav_written"),
+    ("normalize", "logs/normalize", "normalized"),
+    ("encode", "logs/encode", "aac_encoded"),
+    ("tag", "aac", "tagged"),
 )
 
 
@@ -44,10 +55,15 @@ class WorkflowFailed(RuntimeError):
         self.exit_code = exit_code
 
 
+def default_output() -> Path:
+    stamp = datetime.now().astimezone().strftime("%Y%m%d-%H%M%S")
+    return Path.home() / "Music" / "diskflow" / f"{stamp}-{uuid.uuid4().hex[:8]}"
+
+
 def _copy_capture(source: Path, output: Path) -> dict:
     SavedImage.load(source)
     output.mkdir()
-    for name in CAPTURE_FILES:
+    for name in (*CAPTURE_FILES, "hints.json"):
         original = source / name
         if original.is_symlink():
             raise ValueError(f"Archive files must not be symlinks: {name}")
@@ -74,7 +90,7 @@ def _artifact(root: Path, path: Path) -> dict:
 
 def _result(root: Path, tagged: dict) -> dict:
     image = SavedImage.load(root / "capture")
-    final = root / "tagged"
+    final = root / "aac"
     album = _artifact(root, final / "album.json")
     if album["sha256"] != tagged["metadata_manifest_sha256"]:
         raise ValueError("Final album metadata changed")
@@ -90,18 +106,24 @@ def _result(root: Path, tagged: dict) -> dict:
         if audio["sha256"] != entry["sha256"] or audio["bytes"] != entry["bytes"]:
             raise ValueError("Final AAC changed")
         tracks.append({"number": entry["number"], "title": entry["title"], **audio})
-    archive = [
-        _artifact(root, root / "capture" / name)
-        for name in CAPTURE_FILES
+    archive_paths = [
+        root / "capture" / name
+        for name in (*CAPTURE_FILES, "hints.json", "recipe.json")
         if (root / "capture" / name).exists()
     ]
+    archive_paths += [
+        p
+        for p in sorted((root / "capture" / "metadata").iterdir())
+        if METADATA_FILES.fullmatch(p.name)
+    ]
     return {
-        "directory": "tagged",
+        "directory": "aac",
+        "archive_directory": "capture",
         "album": album,
         "artwork": artwork,
         "tracks": tracks,
         "track_count": len(tracks),
-        "archive": archive,
+        "archive": [_artifact(root, p) for p in archive_paths],
         "source_audio_sha256": image.sha256,
         "loudness_normalized": tagged["loudness_normalized"],
         "all_targets_reached": tagged["all_targets_reached"],
@@ -109,9 +131,35 @@ def _result(root: Path, tagged: dict) -> dict:
     }
 
 
+def _remove_work_audio(root: Path) -> None:
+    """Delete only verified audio created in this new job, never an input/archive."""
+    files = []
+    for directory, suffix in (("split", "wav"), ("normalize", "wav"), ("encode", "m4a")):
+        base = root / "logs" / directory
+        if base.is_symlink():
+            raise ValueError("作業フォルダがシンボリックリンクへ変更されました。")
+        report = json.loads((base / "report.json").read_bytes())
+        for entry in report["tracks"]:
+            name = entry["file"]
+            if not re.fullmatch(rf"track-\d{{2}}\.{suffix}", name) and not (
+                directory == "split" and name == "pregap.wav"
+            ):
+                raise ValueError("削除対象に作業用音声以外のファイルが含まれています。")
+            path = base / name
+            actual = _artifact(root, path)
+            key = "wav_sha256" if suffix == "wav" else "sha256"
+            if actual["sha256"] != entry[key]:
+                raise ValueError("作業用音声が変更されました。安全のため削除しません。")
+            files.append(path)
+    for path in files:
+        if not path.resolve().is_relative_to(root / "logs") or path.is_symlink():
+            raise ValueError("削除先が作業フォルダ外です。")
+        path.unlink()
+
+
 def import_album(
-    output: Path,
-    artwork: Path,
+    output: Path | None = None,
+    artwork: Path | None = None,
     *,
     device: str | None = None,
     saved_capture: Path | None = None,
@@ -121,14 +169,16 @@ def import_album(
     passes: int = 2,
     retries: int = 2,
     chunk_sectors: int = 16,
-    target_lufs: float = DEFAULT_TARGET_LUFS,
-    true_peak_dbtp: float = DEFAULT_TRUE_PEAK_DBTP,
-    peak_headroom_db: float = DEFAULT_PEAK_HEADROOM_DB,
+    target_lufs: float | None = None,
+    true_peak_dbtp: float | None = None,
+    peak_headroom_db: float | None = None,
+    query: str | None = None,
+    choose: Chooser | None = None,
+    query_provider: Callable[[], str | None] | None = None,
     stage_progress: Callable[[str, int, int, int], None] | None = None,
 ) -> dict:
-    # Validate arguments and artwork before creating output or touching a CD device.
-    if (device is None) == (saved_capture is None):
-        raise ValueError("Specify exactly one of --device or --capture")
+    if device is not None and saved_capture is not None:
+        raise ValueError("Specify only one of --device or a saved capture")
     if device is not None and not re.fullmatch(r"/dev/rdisk[0-9]+", device):
         raise ValueError("Specify a whole raw CD device, e.g. /dev/rdisk8")
     if (
@@ -148,6 +198,38 @@ def import_album(
         release_id = str(uuid.UUID(release_id))
     if edition is not None:
         edition = _text(edition, "edition")
+    requested = (output or default_output()).expanduser()
+    if requested.exists() or requested.is_symlink():
+        raise FileExistsError(f"Output must be a NEW directory: {requested}")
+    root = requested.resolve()
+    source = resolve_capture(saved_capture) if saved_capture is not None else None
+    cache, recipe, hints = None, None, {}
+    if source is not None:
+        if root.is_relative_to(saved_capture.expanduser().resolve()):
+            raise ValueError("Output must not be inside the source capture directory")
+        image = SavedImage.load(source)
+        cache = cached_metadata(source)
+        if cache is not None:
+            validate_cache(cache, image)
+        recipe = read_recipe(source, cache, image)
+        if (source / "hints.json").exists():
+            hints = json.loads((source / "hints.json").read_bytes())
+            if hints.get("toc_sha256") != hashlib.sha256(image.raw_toc).hexdigest():
+                raise ValueError("保存されたCD情報のTOCが一致しません。")
+    policy = recipe["normalization"] if recipe else {}
+    target_lufs = (
+        target_lufs if target_lufs is not None else policy.get("target_lufs", DEFAULT_TARGET_LUFS)
+    )
+    true_peak_dbtp = (
+        true_peak_dbtp
+        if true_peak_dbtp is not None
+        else policy.get("true_peak_dbtp", DEFAULT_TRUE_PEAK_DBTP)
+    )
+    peak_headroom_db = (
+        peak_headroom_db
+        if peak_headroom_db is not None
+        else policy.get("peak_headroom_db", DEFAULT_PEAK_HEADROOM_DB)
+    )
     if not (
         math.isfinite(target_lufs)
         and -70 < target_lufs < 0
@@ -157,23 +239,26 @@ def import_album(
         and 0 <= peak_headroom_db <= 6
     ):
         raise ValueError("Use finite LUFS (-70..0), peak (-20..0 dBTP), and headroom (0..6 dB)")
-    output = output.expanduser()
-    if output.exists() or output.is_symlink():
-        raise FileExistsError(f"Output must be a NEW directory: {output}")
-    root = output.resolve()
-    source = saved_capture.expanduser().resolve() if saved_capture is not None else None
-    if source is not None:
-        if root.is_relative_to(source):
-            raise ValueError("Output must not be inside the source capture directory")
-        SavedImage.load(source)
-    artwork = artwork.expanduser().resolve()
-    if not artwork.is_file():
-        raise ValueError("--artwork must be a regular JPEG/PNG file")
-    with artwork.open("rb") as image_file:
-        cover = image_file.read(MAX_COVER_BYTES + 1)
-    art = cover_info(cover)
+    cover, art = None, None
+    # A cached jacket takes precedence over an unrelated cover.jpg in the working directory.
+    if artwork is None and cache is None:
+        local = [p for p in (Path.cwd() / "cover.jpg", Path.cwd() / "cover.png") if p.exists()]
+        if len(local) > 1:
+            raise ValueError("cover.jpgとcover.pngが両方あります。使う画像を1枚にしてください。")
+        artwork = local[0] if local else None
+    if artwork is not None:
+        artwork = artwork.expanduser().resolve()
+        if not artwork.is_file():
+            raise ValueError("カバー画像には通常のJPEG/PNGファイルを指定してください。")
+        with artwork.open("rb") as image_file:
+            cover = image_file.read(MAX_COVER_BYTES + 1)
+        art = cover_info(cover)
+    discovery = None
+    if source is None and device is None:
+        discovery = discover_cd(choose=choose)
+        device, hints = discovery["device"], discovery["hints"]
     report = {
-        "schema_version": 1,
+        "schema_version": 2,
         "operation": "import",
         "status": "running",
         "started_at": now(),
@@ -199,34 +284,31 @@ def import_album(
             "true_peak_dbtp": true_peak_dbtp,
             "peak_headroom_db": peak_headroom_db,
         },
-        "artwork_input": {"source_path": str(artwork), **art},
+        "artwork_input": {"source_path": str(artwork), **art} if art else None,
+        "warnings": [],
         "stages": [
-            {
-                "name": name,
-                "directory": directory,
-                "report": f"{directory}/report.json",
-                "status": "pending",
-            }
-            for name, directory, _ in STAGES
+            {"name": n, "directory": d, "report": f"{d}/report.json", "status": "pending"}
+            for n, d, _ in STAGES
         ],
         "result": None,
     }
     root.mkdir(parents=True, exist_ok=False)
-    report_path = root / "report.json"
-    write_json(report_path, report)
+    (root / "logs").mkdir()
+    path = root / "report.json"
+    write_json(path, report)
     current = None
 
     def stage(name: str, action: Callable[[], dict]) -> dict:
         nonlocal current
         current = next(s for s in report["stages"] if s["name"] == name)
         current.update(status="running", started_at=now())
-        write_json(report_path, report)
+        write_json(path, report)
         if stage_progress:
             stage_progress(name, 0, 0, 0)
         value = action()
         manifest = root / current["report"]
         actual = json.loads(manifest.read_bytes())
-        expected = next(expected for key, _, expected in STAGES if key == name)
+        expected = next(e for n, _, e in STAGES if n == name)
         if value.get("status") != expected or actual.get("status") != expected:
             raise ValueError(f"Stage did not complete successfully: {name}")
         current.update(
@@ -235,7 +317,7 @@ def import_album(
             finished_at=now(),
             manifest_sha256=file_sha256(manifest),
         )
-        write_json(report_path, report)
+        write_json(path, report)
         current = None
         return value
 
@@ -247,16 +329,26 @@ def import_album(
         return update
 
     try:
-        # Freeze the supplied cover before a potentially long physical read.
-        cover_name = "input-cover.jpg" if art["format"] == "JPEG" else "input-cover.png"
-        (root / cover_name).write_bytes(cover)
-        report["artwork_input"]["file"] = cover_name
-        write_json(report_path, report)
+        snapshot = None
+        if art is not None:
+            snapshot = (
+                root
+                / "logs"
+                / ("input-cover.jpg" if art["format"] == "JPEG" else "input-cover.png")
+            )
+            snapshot.write_bytes(cover)
 
         def read_capture() -> dict:
             if source is not None:
                 return _copy_capture(source, root / "capture")
             with DarwinCD(device) as reader:
+                raw_toc = reader.read_toc()
+                if (
+                    discovery
+                    and discovery.get("toc_sha256")
+                    and hashlib.sha256(raw_toc).hexdigest() != discovery["toc_sha256"]
+                ):
+                    raise ValueError("自動検出後にCDが交換されました。再実行してください。")
                 return capture(
                     reader,
                     root / "capture",
@@ -269,27 +361,62 @@ def import_album(
                 )
 
         stage("capture", read_capture)
-        metadata = stage(
-            "metadata",
-            lambda: fetch_metadata(
+        image = SavedImage.load(root / "capture")
+        if (
+            discovery
+            and discovery.get("toc_sha256")
+            and hashlib.sha256(image.raw_toc).hexdigest() != discovery["toc_sha256"]
+        ):
+            raise ValueError("自動検出後にCDが交換されました。再実行してください。")
+        if hints:
+            hints["toc_sha256"] = hashlib.sha256(image.raw_toc).hexdigest()
+            write_json(root / "capture" / "hints.json", hints)
+        meta_dir = root / "capture" / "metadata"
+
+        def obtain_metadata() -> dict:
+            if (
+                cache is not None
+                and apple_album_id is None
+                and release_id is None
+                and query is None
+            ):
+                return reuse_metadata(
+                    cache, root / "capture", meta_dir, artwork=snapshot, edition=edition
+                )
+            return fetch_metadata(
                 root / "capture",
-                root / "metadata",
+                meta_dir,
                 apple_album_id=apple_album_id,
                 release_id=release_id,
                 edition=edition,
-                artwork=root / cover_name,
-            ),
-        )
-        if metadata["artwork"]["sha256"] != art["sha256"]:
+                artwork=snapshot,
+                automatic=True,
+                hints=hints,
+                query=query,
+                choose=choose,
+                query_provider=query_provider,
+            )
+
+        metadata = stage("metadata", obtain_metadata)
+        if art and metadata["artwork"]["sha256"] != art["sha256"]:
             raise ValueError("Cover snapshot changed during metadata acquisition")
+        if metadata["artwork"].get("selection") == "provider_default":
+            report["warnings"].append(
+                "カバーはデータベースの画像です。実物の通常盤・初回盤との一致は未確認です。"
+            )
+        if report["artwork_input"] is not None:
+            report["artwork_input"]["file"] = f"capture/metadata/{metadata['artwork']['file']}"
         stage(
-            "split", lambda: split_wav(root / "capture", root / "wav", progress=progress("split"))
+            "split",
+            lambda: split_wav(
+                root / "capture", root / "logs" / "split", progress=progress("split")
+            ),
         )
         stage(
             "normalize",
             lambda: normalize_wavs(
-                root / "wav",
-                root / "normalized",
+                root / "logs" / "split",
+                root / "logs" / "normalize",
                 target_lufs=target_lufs,
                 true_peak_dbtp=true_peak_dbtp,
                 peak_headroom_db=peak_headroom_db,
@@ -298,25 +425,42 @@ def import_album(
         )
         stage(
             "encode",
-            lambda: encode_aac(root / "normalized", root / "aac", progress=progress("encode")),
+            lambda: encode_aac(
+                root / "logs" / "normalize", root / "logs" / "encode", progress=progress("encode")
+            ),
         )
 
         def tag_tracks() -> dict:
-            if file_sha256(root / "metadata" / "album.json") != metadata["album_sha256"]:
+            if file_sha256(meta_dir / "album.json") != metadata["album_sha256"]:
                 raise ValueError("Metadata manifest changed before tagging")
             return tag_album(
-                root / "aac", root / "metadata", root / "tagged", progress=progress("tag")
+                root / "logs" / "encode", meta_dir, root / "aac", progress=progress("tag")
             )
 
         tagged = stage("tag", tag_tracks)
         for entry in report["stages"]:
             if file_sha256(root / entry["report"]) != entry["manifest_sha256"]:
                 raise ValueError(f"Stage report changed: {entry['name']}")
-        if file_sha256(root / cover_name) != art["sha256"]:
+        if snapshot and file_sha256(snapshot) != art["sha256"]:
             raise ValueError("Cover snapshot changed")
-        report["result"] = _result(root, tagged)
-        report.update(status="complete", finished_at=now())
-        write_json(report_path, report)
+        write_recipe(
+            root / "capture",
+            metadata,
+            {
+                "target_lufs": target_lufs,
+                "true_peak_dbtp": true_peak_dbtp,
+                "peak_headroom_db": peak_headroom_db,
+            },
+        )
+        result = _result(root, tagged)
+        _remove_work_audio(root)
+        if snapshot:
+            snapshot.unlink()
+        for entry in report["stages"]:
+            if entry["name"] in ("split", "normalize", "encode"):
+                entry["audio_retained"] = False
+        report.update(status="complete", finished_at=now(), result=result)
+        write_json(path, report)
         return report
     except (Exception, KeyboardInterrupt) as exc:
         if current is not None:
@@ -324,7 +468,7 @@ def import_album(
         report.update(
             status="failed", error=f"{type(exc).__name__}: {exc}", finished_at=now(), result=None
         )
-        write_json(report_path, report)
+        write_json(path, report)
         raise WorkflowFailed(report, 130 if isinstance(exc, KeyboardInterrupt) else 1) from exc
 
 
@@ -345,33 +489,60 @@ def main(environ: Mapping[str, str] | None = None) -> int:
     def option(name: str) -> str | None:
         return env.get(f"usage_{name}") or None
 
+    def choose(prompt: str, candidates: list[dict]) -> int:
+        print(prompt, file=sys.stderr)
+        for i, item in enumerate(candidates, 1):
+            print(f"  {i}. {item['label']}", file=sys.stderr)
+        print("番号（空欄で中止）: ", end="", file=sys.stderr, flush=True)
+        answer = sys.stdin.readline().strip()
+        return int(answer) - 1 if answer.isdecimal() else -1
+
+    def ask_query() -> str | None:
+        print(
+            "CDの曲情報が未登録です。アーティスト名・アルバム名を入力してください（空欄で中止）: ",
+            end="",
+            file=sys.stderr,
+            flush=True,
+        )
+        return sys.stdin.readline().strip() or None
+
     try:
-        output, artwork = option("output"), option("artwork")
-        if output is None or artwork is None:
-            raise ValueError("Use mise run import --help; --output and --artwork are required")
+        saved = option("source") or option("capture")
+        if option("source") and option("capture"):
+            raise ValueError("保存フォルダは1つだけ指定してください。")
+        interactive = sys.stdin.isatty() and option("non_interactive") != "true"
         apple_id = option("apple_album_id")
+        output = Path(option("output")) if option("output") else default_output()
+        print(f"保存先: {output}", file=sys.stderr)
         report = import_album(
-            Path(output),
-            Path(artwork),
+            output,
+            Path(option("artwork")) if option("artwork") else None,
             device=option("device"),
-            saved_capture=Path(option("capture")) if option("capture") else None,
-            apple_album_id=int(apple_id) if apple_id is not None else None,
+            saved_capture=Path(saved) if saved else None,
+            apple_album_id=int(apple_id) if apple_id else None,
             release_id=option("release_id"),
             edition=option("edition"),
             passes=int(option("passes") or "2"),
             retries=int(option("retries") or "2"),
             chunk_sectors=int(option("chunk_sectors") or "16"),
-            target_lufs=float(option("target_lufs") or str(DEFAULT_TARGET_LUFS)),
-            true_peak_dbtp=float(option("true_peak") or str(DEFAULT_TRUE_PEAK_DBTP)),
-            peak_headroom_db=float(option("peak_headroom") or str(DEFAULT_PEAK_HEADROOM_DB)),
+            target_lufs=float(option("target_lufs")) if option("target_lufs") else None,
+            true_peak_dbtp=float(option("true_peak")) if option("true_peak") else None,
+            peak_headroom_db=float(option("peak_headroom")) if option("peak_headroom") else None,
+            query=option("search"),
+            choose=choose if interactive else None,
+            query_provider=ask_query if interactive else None,
             stage_progress=progress,
         )
+        for warning in report["warnings"]:
+            print(warning, file=sys.stderr)
+        print(f"完成AAC: {Path(report['output_directory']) / 'aac'}", file=sys.stderr)
+        print(f"保存用capture: {Path(report['output_directory']) / 'capture'}", file=sys.stderr)
         code = 0
     except WorkflowFailed as exc:
         report, code = exc.report, exc.exit_code
     except (OSError, ValueError, RuntimeError) as exc:
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "operation": "import",
             "status": "failed",
             "archival_verified": False,
@@ -381,7 +552,7 @@ def main(environ: Mapping[str, str] | None = None) -> int:
         code = 1
     except KeyboardInterrupt:
         report = {
-            "schema_version": 1,
+            "schema_version": 2,
             "operation": "import",
             "status": "failed",
             "archival_verified": False,

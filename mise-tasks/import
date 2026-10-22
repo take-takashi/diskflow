@@ -1,19 +1,24 @@
 #!/usr/bin/env bash
-#MISE description="CD取り込みからタグ付きAACまで一括実行し、指定フォルダへ保存"
+#MISE description="CDを自動検出し、保存用captureと完成品AACを生成"
 #MISE quiet=true
-#USAGE flag "--device <device>" help="取り込む音楽CDのrawデバイス（--captureとどちらか一方）"
-#USAGE flag "--capture <dir>" help="保存済みripのフォルダ（CDを再読み取りせずコピー、--deviceとどちらか一方）"
-#USAGE flag "-o --output <dir>" required=#true help="CDごとの新しい出力フォルダ（既存フォルダは上書きしない）"
-#USAGE flag "--artwork <file>" required=#true help="埋め込むカバー画像（JPEG/PNG）"
+#MISE raw=true
+#USAGE unknown_flags "error"
+#USAGE arg "[source]" help="CDなしで作り直す場合の保存フォルダ（captureまたはアルバム全体）"
+#USAGE flag "-o --output <dir>" help="新しい保存先（省略時は ~/Music/diskflow/日時、上書き不可）"
+#USAGE flag "--artwork <file>" help="使うカバー画像（省略時は保存済み画像、cover.jpg/cover.png、DB画像の順）"
+#USAGE flag "--search <query>" help="自動照合できない場合の検索語（アーティスト名・アルバム名）"
 #USAGE flag "--edition <label>" help="版の記録用ラベル（例: 初回限定盤）"
-#USAGE flag "--apple-album-id <id>" help="MusicBrainzの代わりに使うAppleアルバムID（--release-idと併用不可）"
-#USAGE flag "--release-id <id>" help="MusicBrainzのリリースID（候補の選択用）"
-#USAGE flag "--passes <count>" default="2" help="CDの読み取り回数（2以上、--device使用時）"
-#USAGE flag "--retries <count>" default="2" help="読み取りエラー時の追加試行回数（--device使用時）"
-#USAGE flag "--chunk-sectors <count>" default="16" help="1回に読むセクター数（1〜75、--device使用時）"
-#USAGE flag "--target-lufs <lufs>" default="-14" help="曲別の音量目標（例: --target-lufs=-14）"
-#USAGE flag "--true-peak <dbtp>" default="-1" help="True Peakの上限（例: --true-peak=-1）"
-#USAGE flag "--peak-headroom <db>" default="0.05" help="正規化WAVに確保する追加のピーク余裕（dB）"
+#USAGE flag "--non-interactive" help="候補の番号選択や検索語の入力を求めず、不明な場合は停止"
+#USAGE flag "--device <device>" hide=#true help="音楽CDのrawデバイスを明示指定"
+#USAGE flag "--capture <dir>" hide=#true help="再生成する保存済みcapture（旧形式の指定方法）"
+#USAGE flag "--apple-album-id <id>" hide=#true help="AppleアルバムIDを明示指定"
+#USAGE flag "--release-id <id>" hide=#true help="MusicBrainzリリースIDを明示指定"
+#USAGE flag "--passes <count>" default="2" help="CDの読み取り回数（2以上）"
+#USAGE flag "--retries <count>" default="2" help="読み取りエラー時の追加試行回数"
+#USAGE flag "--chunk-sectors <count>" default="16" help="1回に読むセクター数（1〜75）"
+#USAGE flag "--target-lufs <lufs>" help="曲別の音量目標（通常-14、再生成時は保存設定を使用）"
+#USAGE flag "--true-peak <dbtp>" help="True Peak上限（通常-1、再生成時は保存設定を使用）"
+#USAGE flag "--peak-headroom <db>" help="追加のピーク余裕（通常0.05、再生成時は保存設定を使用）"
 
 set -euo pipefail
 exec uv run --locked python -m diskflow.workflow

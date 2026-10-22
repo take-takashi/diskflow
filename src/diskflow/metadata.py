@@ -8,6 +8,7 @@ import re
 import time
 import unicodedata
 import uuid
+from collections.abc import Callable
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import urlencode, urlsplit, urlunsplit
@@ -21,6 +22,11 @@ from diskflow.toc import TOC
 USER_AGENT = "diskflow/0.1.0 (https://github.com/take-takashi/diskflow)"
 DURATION_TOLERANCE_MS = 2000
 MAX_COVER_BYTES = 8 * 1024 * 1024
+Chooser = Callable[[str, list[dict]], int]
+
+
+class DiscNotRegistered(ValueError):
+    pass
 
 
 def disc_id(toc: TOC) -> str:
@@ -102,6 +108,7 @@ class MetadataClient:
     def __init__(self, output: Path):
         self.output = output
         self.last_musicbrainz = None
+        self.last_apple = None
 
     def get(self, url: str, name: str, *, image: bool = False) -> bytes:
         if urlsplit(url).scheme != "https":
@@ -110,6 +117,10 @@ class MetadataClient:
             if self.last_musicbrainz is not None:
                 time.sleep(max(0, 1.1 - (time.monotonic() - self.last_musicbrainz)))
             self.last_musicbrainz = time.monotonic()
+        if urlsplit(url).hostname == "itunes.apple.com":
+            if self.last_apple is not None:
+                time.sleep(max(0, 3.1 - (time.monotonic() - self.last_apple)))
+            self.last_apple = time.monotonic()
         limit = MAX_COVER_BYTES if image else 2 * 1024 * 1024
         record = {"time": now(), "url": url, "file": name}
         try:
@@ -224,7 +235,10 @@ def _credit(value) -> str:
 
 
 def _musicbrainz(
-    client: MetadataClient, identifier: str, release_id: str | None
+    client: MetadataClient,
+    identifier: str,
+    release_id: str | None,
+    choose: Chooser | None = None,
 ) -> tuple[dict, str]:
     url = f"https://musicbrainz.org/ws/2/discid/{identifier}?" + urlencode(
         {"inc": "artists recordings", "fmt": "json"}
@@ -233,7 +247,7 @@ def _musicbrainz(
         response = client.json(url, "musicbrainz-disc.json")
     except HTTPError as exc:
         if exc.code == 404:
-            raise ValueError(
+            raise DiscNotRegistered(
                 "Disc ID is not registered in MusicBrainz; use an explicit --apple-album-id"
             ) from exc
         raise
@@ -249,12 +263,22 @@ def _musicbrainz(
     write_json(client.output / "candidates.json", {"releases": candidates})
     ids = [candidate["id"] for candidate in candidates]
     if release_id is None:
-        if len(ids) != 1:
+        if len(ids) > 1 and choose is not None:
+            for candidate in candidates:
+                candidate["label"] = " / ".join(
+                    str(candidate.get(k) or "") for k in ("title", "date", "country")
+                )
+            index = choose("CDの曲情報の候補を選んでください", candidates)
+            if type(index) is not int or not 0 <= index < len(ids):
+                raise ValueError("曲情報の選択を中止しました。")
+            release_id = ids[index]
+        elif len(ids) != 1:
             raise ValueError(
                 "MusicBrainz release is ambiguous/missing; "
                 "inspect candidates.json and use --release-id"
             )
-        release_id = ids[0]
+        else:
+            release_id = ids[0]
     release_id = str(uuid.UUID(str(release_id)))
     if release_id not in ids:
         raise ValueError("Selected MusicBrainz release does not contain this Disc ID")
@@ -307,6 +331,83 @@ def _musicbrainz(
     }, f"https://coverartarchive.org/release/{release_id}/front-500"
 
 
+def _apple_search(
+    client: MetadataClient,
+    toc: TOC,
+    hints: dict,
+    query: str | None,
+    choose: Chooser | None,
+) -> tuple[dict, str | None]:
+    titles = {
+        int(k): unicodedata.normalize("NFC", v) for k, v in hints.get("track_titles", {}).items()
+    }
+    term = query or hints.get("album") or next(iter(titles.values()), None)
+    if not term:
+        raise ValueError(
+            "CDの曲情報が未登録で、検索に使える情報がありません。アルバム名を入力してください。"
+        )
+    url = "https://itunes.apple.com/search?" + urlencode(
+        {
+            "term": _text(term, "search query"),
+            "country": "JP",
+            "media": "music",
+            "entity": "album" if query or hints.get("album") else "song",
+            "limit": 50,
+        }
+    )
+    response = client.json(url, "apple-search.json")
+    rows = _objects(response.get("results", []), "Apple search results")
+    ids = sorted(
+        {
+            r["collectionId"]
+            for r in rows
+            if type(r.get("collectionId")) is int
+            and r["collectionId"] > 0
+            and r.get("trackCount", len(toc.tracks)) == len(toc.tracks)
+        }
+    )
+    if len(rows) >= 50 or len(ids) > 10:
+        raise ValueError(
+            "曲情報の検索候補が多すぎます。アーティスト名とアルバム名で絞ってください。"
+        )
+    matches = []
+    for album_id in ids:
+        # An incomplete/malformed lookup must not be discarded to make another
+        # candidate appear unique. Transport/protocol errors stop the search.
+        album, cover_url = _apple(client, album_id)
+        # Keep all lookup responses as provenance, not just the last candidate.
+        (client.output / "apple.json").rename(client.output / f"apple-{album_id}.json")
+        try:
+            validate_tracks(toc, album["tracks"])
+        except ValueError:
+            continue
+        if any(titles.get(t["number"], t["title"]) != t["title"] for t in album["tracks"]):
+            continue
+        album["source"]["note"] = (
+            "Automatic Apple search; track count/order/durations checked against TOC; "
+            "physical edition not identified"
+        )
+        album["source"]["selection"] = "automatic_toc_match"
+        matches.append((album, cover_url))
+    write_json(
+        client.output / "candidates.json",
+        {
+            "releases": [
+                {"id": a["source"]["id"], "label": f"{a['artist']} / {a['title']} / {a['date']}"}
+                for a, _ in matches
+            ]
+        },
+    )
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1 and choose is not None:
+        choices = [{"label": f"{a['artist']} / {a['title']} / {a['date']}"} for a, _ in matches]
+        index = choose("CDと一致する曲情報が複数あります", choices)
+        if type(index) is int and 0 <= index < len(matches):
+            return matches[index]
+    raise ValueError("曲情報を一意に照合できませんでした。アルバム名を確認して再検索してください。")
+
+
 def _artwork(
     client: MetadataClient,
     provider_url: str | None,
@@ -348,6 +449,11 @@ def fetch_metadata(
     artwork: Path | None = None,
     artwork_url: str | None = None,
     edition: str | None = None,
+    automatic: bool = False,
+    hints: dict | None = None,
+    query: str | None = None,
+    choose: Chooser | None = None,
+    query_provider: Callable[[], str | None] | None = None,
 ) -> dict:
     if apple_album_id is not None and release_id is not None:
         raise ValueError("Select either Apple or MusicBrainz, not both")
@@ -380,11 +486,19 @@ def fetch_metadata(
             musicbrainz_disc_id=identifier,
             source_toc_sha256=hashlib.sha256(image.raw_toc).hexdigest(),
         )
-        album, cover_url = (
-            _apple(client, apple_album_id)
-            if apple_album_id is not None
-            else _musicbrainz(client, identifier, release_id)
-        )
+        try:
+            album, cover_url = (
+                _apple(client, apple_album_id)
+                if apple_album_id is not None
+                else _musicbrainz(client, identifier, release_id, choose=choose)
+            )
+        except DiscNotRegistered:
+            if not automatic or release_id is not None:
+                raise
+            search_hints = hints or {}
+            if not query and not search_hints.get("album") and not search_hints.get("track_titles"):
+                query = query_provider() if query_provider else None
+            album, cover_url = _apple_search(client, image.toc, search_hints, query, choose)
         maximum = validate_tracks(image.toc, album["tracks"])
         if not re.fullmatch(r"\d{4}(?:-\d{2}(?:-\d{2})?)?", album["date"]):
             raise ValueError("Invalid album release date")

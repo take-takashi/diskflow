@@ -1,3 +1,4 @@
+import hashlib
 import json
 import os
 import shutil
@@ -58,7 +59,7 @@ def test_saved_capture_pipeline_is_self_contained_and_machine_readable(
         output, local_cover, saved_capture=source, apple_album_id=123, edition="初回限定盤"
     )
     assert result == json.loads((output / "report.json").read_bytes())
-    assert result["schema_version"] == 1
+    assert result["schema_version"] == 2
     assert result["operation"] == "import"
     assert result["status"] == "complete"
     assert result["archival_verified"] is False
@@ -67,13 +68,22 @@ def test_saved_capture_pipeline_is_self_contained_and_machine_readable(
     assert result["result"]["track_count"] == 2
     assert result["result"]["loudness_normalized"] is True
     assert result["result"]["all_targets_reached"] is False  # Very short test audio.
-    assert result["result"]["directory"] == "tagged"
+    assert result["result"]["directory"] == "aac"
+    assert result["result"]["archive_directory"] == "capture"
+    assert (output / "capture" / "recipe.json").exists()
+    assert (output / "capture" / "metadata" / "album.json").exists()
+    assert not (output / "tagged").exists()
+    assert not list((output / "logs").rglob("*.wav"))
+    assert not list((output / "logs").rglob("*.m4a"))
+    assert not (output / "wav").exists()
+    assert not (output / "normalized").exists()
     assert [s["name"] for s in result["stages"]] == [s[0] for s in workflow.STAGES]
     assert all(s["status"] == "complete" for s in result["stages"])
     assert not (output / "capture" / "unrelated.txt").exists()
     assert {p.name: p.read_bytes() for p in source.iterdir()} == before
     assert local_cover.read_bytes() == cover_before
-    assert (output / "input-cover.jpg").read_bytes() == cover_before
+    assert (output / "capture" / "metadata" / "cover.jpg").read_bytes() == cover_before
+    assert not (output / "logs" / "input-cover.jpg").exists()
     artifacts = result["result"]
     for item in [
         artifacts["album"],
@@ -159,6 +169,11 @@ def test_bad_arguments_cannot_read_cd_or_overwrite_input(
         raise AssertionError("Preflight must run before CD access")
 
     monkeypatch.setattr(workflow, "DarwinCD", no_cd)
+
+    def no_media(**_):
+        raise ValueError("音楽CDが見つかりません。")
+
+    monkeypatch.setattr(workflow, "discover_cd", no_media)
     options = {"saved_capture": captured[0], "apple_album_id": 123}
     output = tmp_path / "album"
     if change == "no_source":
@@ -241,7 +256,7 @@ def test_pipeline_stops_and_reports_partial_results(
 
         def changed(directory, output, **kwargs):
             result = original(directory, output, **kwargs)
-            path = directory.parent / "metadata" / "report.json"
+            path = directory.parent.parent / "capture" / "metadata" / "report.json"
             path.write_bytes(path.read_bytes() + b"\n")
             return result
 
@@ -261,7 +276,7 @@ def test_pipeline_stops_and_reports_partial_results(
         failed_index = next(i for i, s in enumerate(result["stages"]) if s["name"] == failed_stage)
         assert result["stages"][failed_index]["status"] == "failed"
         assert all(s["status"] == "pending" for s in result["stages"][failed_index + 1 :])
-        assert not (output / "tagged").exists()
+        assert not (output / "aac").exists()
 
 
 def test_usage_environment_main_returns_only_json_on_stdout(
@@ -291,7 +306,12 @@ def test_usage_environment_main_returns_only_json_on_stdout(
     "environment",
     [{}, {"usage_output": "out", "usage_artwork": "cover.jpg", "usage_passes": "bad"}],
 )
-def test_main_preflight_error_is_json(environment, capsys):
+def test_main_preflight_error_is_json(environment, capsys, monkeypatch, tmp_path):
+    def no_media(**_):
+        raise ValueError("音楽CDが見つかりません。")
+
+    monkeypatch.setattr(workflow, "discover_cd", no_media)
+    monkeypatch.setattr(workflow, "default_output", lambda: tmp_path / "output")
     assert workflow.main(environment) == 1
     result = json.loads(capsys.readouterr().out)
     assert result["status"] == "failed"
@@ -317,9 +337,9 @@ def test_mise_usage_help_required_flags_and_argument_forwarding(tmp_path):
     assert help_result.returncode == 0
     assert "--output" in help_result.stdout
     assert "--artwork" in help_result.stdout
-    assert "--capture" in help_result.stdout
-    missing = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True, timeout=30)
-    assert missing.returncode != 0
+    assert "--capture" not in help_result.stdout
+    assert "--apple-album-id" not in help_result.stdout
+    assert "[source]" in help_result.stdout
     # A fake uv records parsed Usage values without invoking CD or network operations.
     binary = tmp_path / "bin"
     binary.mkdir()
@@ -328,7 +348,7 @@ def test_mise_usage_help_required_flags_and_argument_forwarding(tmp_path):
         "#!/bin/bash\n"
         'if [[ -n "${FAKE_EXIT_CODE:-}" ]]; then exit "$FAKE_EXIT_CODE"; fi\n'
         'printf \'%s\\n\' "$usage_output" "$usage_capture" "$usage_artwork" '
-        '"$usage_target_lufs" "$usage_apple_album_id"\n'
+        '"$usage_target_lufs" "$usage_apple_album_id" "$usage_source"\n'
     )
     fake_uv.chmod(0o755)
     path_env = env | {"PATH": str(binary) + os.pathsep + env["PATH"]}
@@ -360,11 +380,24 @@ def test_mise_usage_help_required_flags_and_argument_forwarding(tmp_path):
         timeout=30,
     )
     assert parsed.returncode == 0, parsed.stderr
-    assert parsed.stdout.splitlines() == values
+    assert parsed.stdout.splitlines() == [*values, ""]
+    automatic = subprocess.run(
+        command, cwd=project, env=path_env, capture_output=True, text=True, timeout=30
+    )
+    assert automatic.returncode == 0
+    positional = subprocess.run(
+        command + ["保存したフォルダ"],
+        cwd=project,
+        env=path_env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert positional.returncode == 0
+    assert positional.stdout.splitlines()[-1] == "保存したフォルダ"
     for flags in (
-        ["--capture", "saved", "--artwork", "cover.jpg"],
-        ["--capture", "saved", "--output", "out"],
         ["--output", "out", "--artwork", "cover.jpg", "--unknown-flag"],
+        ["first", "second"],
     ):
         rejected = subprocess.run(
             command + flags, cwd=project, env=path_env, capture_output=True, text=True, timeout=30
@@ -465,14 +498,14 @@ def test_input_snapshots_cannot_change_during_processing(
 
     def changed(directory, output, **kwargs):
         result = original(directory, output, **kwargs)
-        root = directory.parent
+        root = directory.parent.parent
         if damage == "metadata":
-            path = root / "metadata" / "album.json"
+            path = root / "capture" / "metadata" / "album.json"
             album = json.loads(path.read_bytes())
             album["title"] = "changed after lookup"
             write_json(path, album)
         else:
-            (root / "input-cover.jpg").write_bytes(b"changed snapshot")
+            (root / "logs" / "input-cover.jpg").write_bytes(b"changed snapshot")
         return result
 
     monkeypatch.setattr(workflow, "encode_aac", changed)
@@ -482,7 +515,7 @@ def test_input_snapshots_cannot_change_during_processing(
     result = json.loads((output / "report.json").read_bytes())
     assert result["status"] == "failed" and result["result"] is None
     if damage == "metadata":
-        assert not (output / "tagged").exists()
+        assert not (output / "aac").exists()
 
 
 @pytest.mark.parametrize("kind", ["symlink", "traversal"])
@@ -498,3 +531,201 @@ def test_result_artifacts_cannot_escape_output(tmp_path, kind):
         path = root / ".." / "outside"
     with pytest.raises(ValueError, match="inside output"):
         workflow._artifact(root, path)
+
+
+def test_completed_output_has_only_finished_aac_and_archive(
+    local_pipeline, captured, tmp_path, monkeypatch
+):
+    monkeypatch.chdir(tmp_path)
+    output = tmp_path / "album"
+    result = workflow.import_album(output, saved_capture=captured[0])
+    assert result["status"] == "complete"
+    assert result["warnings"]
+    assert result["result"]["directory"] == "aac"
+    assert not list(output.rglob("*.wav"))
+    assert len(list(output.rglob("*.m4a"))) == 2
+    assert all(p.parent == output / "aac" for p in output.rglob("*.m4a"))
+    assert not (output / "tagged").exists()
+    recipe = json.loads((output / "capture" / "recipe.json").read_bytes())
+    assert recipe["metadata_sha256"] == file_sha256(output / "capture" / "metadata" / "album.json")
+    assert recipe["files"]["audio.bin"] == file_sha256(output / "capture" / "audio.bin")
+
+
+def test_capture_alone_regenerates_without_cd_network_or_ids(
+    local_pipeline, captured, local_cover, tmp_path, monkeypatch
+):
+    from diskflow.metadata import MetadataClient
+
+    first = tmp_path / "first"
+    initial = workflow.import_album(
+        first,
+        local_cover,
+        saved_capture=captured[0],
+        target_lufs=-18,
+        true_peak_dbtp=-2,
+        peak_headroom_db=0.5,
+    )
+    stored = (first / "capture").rename(tmp_path / "capture-only")
+    first.rename(tmp_path / "old-output-not-used")
+    before = {str(p.relative_to(stored)): file_sha256(p) for p in stored.rglob("*") if p.is_file()}
+
+    def no_network(*args, **kwargs):
+        raise AssertionError("Restoring a capture must not use any metadata service")
+
+    monkeypatch.setattr(MetadataClient, "get", no_network)
+    second = tmp_path / "second"
+    result = workflow.import_album(second, saved_capture=stored)
+    assert result["status"] == "complete"
+    assert result["parameters"]["target_lufs"] == -18
+    assert result["parameters"]["true_peak_dbtp"] == -2
+    assert result["parameters"]["peak_headroom_db"] == 0.5
+    assert result["result"]["source_audio_sha256"] == initial["result"]["source_audio_sha256"]
+    assert (second / result["result"]["artwork"]["file"]).read_bytes() == local_cover.read_bytes()
+    assert (
+        json.loads((second / "capture" / "metadata" / "report.json").read_bytes())[
+            "metadata_reused"
+        ]
+        is True
+    )
+    assert {
+        str(p.relative_to(stored)): file_sha256(p) for p in stored.rglob("*") if p.is_file()
+    } == before
+    override = workflow.import_album(tmp_path / "override", saved_capture=stored, target_lufs=-16)
+    assert override["parameters"]["target_lufs"] == -16
+
+
+@pytest.mark.parametrize("damage", ["metadata", "cover", "recipe", "inventory", "settings"])
+def test_corrupt_bundle_is_not_silently_replaced_from_network(
+    local_pipeline, captured, local_cover, tmp_path, monkeypatch, damage
+):
+    first = tmp_path / "first"
+    workflow.import_album(first, local_cover, saved_capture=captured[0])
+    stored = first / "capture"
+    if damage == "metadata":
+        path = stored / "metadata" / "album.json"
+        data = json.loads(path.read_bytes())
+        data["title"] = "altered"
+        write_json(path, data)
+    elif damage == "cover":
+        (stored / "metadata" / "cover.jpg").write_bytes(b"corrupt")
+    elif damage == "inventory":
+        (stored / "toc.json").write_text("unrecorded file")
+    else:
+        path = stored / "recipe.json"
+        data = json.loads(path.read_bytes())
+        if damage == "recipe":
+            data["encoding"]["bitrate_bps"] = 123
+        else:
+            data["normalization"]["target_lufs"] = "invalid"
+        write_json(path, data)
+    from diskflow.metadata import MetadataClient
+
+    monkeypatch.setattr(MetadataClient, "get", lambda *a, **kw: pytest.fail("no network fallback"))
+    output = tmp_path / "second"
+    with pytest.raises(ValueError):
+        workflow.import_album(output, saved_capture=stored)
+    assert not output.exists()
+
+
+def test_no_parameters_discovers_cd_and_cover_and_chooses_output(
+    local_pipeline, captured, cover_bytes, tmp_path, monkeypatch, capsys
+):
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "cover.jpg").write_bytes(cover_bytes)
+    output = tmp_path / "automatic-output"
+    monkeypatch.setattr(workflow, "default_output", lambda: output)
+    monkeypatch.setattr(
+        workflow,
+        "discover_cd",
+        lambda **_: {"device": "/dev/rdisk99", "hints": {"album": "テストアルバム"}},
+    )
+
+    class Reader:
+        def __init__(self, device):
+            assert device == "/dev/rdisk99"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def read_toc(self):
+            return (captured[0] / "toc.bin").read_bytes()
+
+        def read_audio(self, lba, count):
+            return captured[1][lba * 2352 : (lba + count) * 2352]
+
+    monkeypatch.setattr(workflow, "DarwinCD", Reader)
+    assert workflow.main({}) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["output_directory"] == str(output)
+    assert report["parameters"]["apple_album_id"] is None
+    assert (output / report["result"]["artwork"]["file"]).read_bytes() == cover_bytes
+    assert (output / "capture" / "hints.json").exists()
+
+
+def test_positional_album_folder_restores_with_no_other_arguments(
+    local_pipeline, captured, local_cover, tmp_path, monkeypatch, capsys
+):
+    source = tmp_path / "source"
+    workflow.import_album(source, local_cover, saved_capture=captured[0])
+    output = tmp_path / "automatic-restore"
+    monkeypatch.setattr(workflow, "default_output", lambda: output)
+    assert workflow.main({"usage_source": str(source)}) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["result"]["directory"] == "aac"
+    assert report["source"]["path"] == str(source / "capture")
+
+
+def test_originals_and_finished_files_are_retained_if_work_cleanup_fails(
+    local_pipeline, captured, local_cover, tmp_path, monkeypatch
+):
+    def fail(*args):
+        raise OSError("cleanup failed")
+
+    monkeypatch.setattr(workflow, "_remove_work_audio", fail)
+    output = tmp_path / "album"
+    with pytest.raises(workflow.WorkflowFailed, match="cleanup failed"):
+        workflow.import_album(output, local_cover, saved_capture=captured[0])
+    assert (output / "capture" / "audio.bin").read_bytes() == captured[1]
+    assert len(list((output / "aac").glob("*.m4a"))) == 2
+    assert json.loads((output / "report.json").read_bytes())["result"] is None
+
+
+def test_cd_swap_after_preview_is_rejected_before_metadata(
+    local_pipeline, fake_metadata, captured, local_cover, make_toc, tmp_path, monkeypatch
+):
+    original_toc = (captured[0] / "toc.bin").read_bytes()
+    changed_toc = make_toc(starts=(0, 6))
+    monkeypatch.setattr(
+        workflow,
+        "discover_cd",
+        lambda **_: {
+            "device": "/dev/rdisk99",
+            "hints": {},
+            "toc_sha256": hashlib.sha256(original_toc).hexdigest(),
+        },
+    )
+
+    class Reader:
+        def __init__(self, device):
+            self.toc_reads = 0
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def read_toc(self):
+            self.toc_reads += 1
+            return original_toc if self.toc_reads == 1 else changed_toc
+
+        def read_audio(self, lba, count):
+            return captured[1][lba * 2352 : (lba + count) * 2352]
+
+    monkeypatch.setattr(workflow, "DarwinCD", Reader)
+    with pytest.raises(workflow.WorkflowFailed, match="交換"):
+        workflow.import_album(tmp_path / "album", local_cover)
+    assert fake_metadata.calls == []

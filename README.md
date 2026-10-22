@@ -66,80 +66,95 @@ mise exec -- uv run --locked diskflow --help
 
 ### CDから取り込む
 
-先に`mise run inspect`で音楽CDのデバイスを確認する。以下の`rdisk8`は例であり、番号を推測しない。
-カバー画像を用意し、CDごとに新しい出力先を指定する。
+音楽CDを挿入し、Music.appなどの再生・別の取り込みを止めて実行する。通常はパラメータを指定しない。
 
 ```sh
-mise run import -- --device /dev/rdisk8 \
-  --output "$HOME/Music/CD Archive/album-01" \
-  --artwork ./covers/limited.jpg
+mise run import
 ```
 
-`--output`と`--artwork`は必須。出力先は任意の場所を選べるが、既存のファイルやフォルダは拒否する。
-相対パスはmiseの作業ディレクトリ（通常はプロジェクトルート）を基準に解釈する。
-別のアプリから呼び出す場合は絶対パスを推奨する。
+接続された光学メディアからCDを検出し、曲情報を照合して、`~/Music/diskflow/日時-識別子/`へ保存する。
+一般のハードディスクからデバイス番号を推測することはしない。
+複数のCDがある場合は番号で選択する。曲情報はMusicBrainzのDisc IDで照合し、未登録なら
+macOSから得たアルバム名・曲名でAppleを検索して、曲数・曲順・全曲の長さを検証する。
+検索する名前が取れない場合は、端末でアーティスト名・アルバム名を尋ねる。内部のアルバムIDを調べる必要はない。
 
-曲情報は既定でMusicBrainzを使う。候補の選択は`--release-id`、Appleへの明示的な切り替えは
-`--apple-album-id`を使う。`--edition`は任意の記録用ラベルで、カバーの自動判定には使わない。
-オプション一覧はUsageの定義から生成される。
+複数候補は勝手に確定せず、端末で選択する。`--non-interactive`では入力を求めず停止する。
+DB未登録・情報不足・表記や時間の不一致により、自動照合できないCDもある。
+
+### カバーと保存先を指定する
+
+初回限定盤などのカバーを使いたい場合は、プロジェクトルートに`cover.jpg`または`cover.png`を1枚置いておく。
+どちらもない場合はDBの画像を使うが、通常盤・初回盤との一致は保証しない。その旨を結果に記録する。
+CDの曲配置だけで、物理商品の版やジャケットを判別することはできない。
+
+画像や保存先を明示することもできる。
 
 ```sh
-mise run import --help
+mise run import -- --artwork ./covers/limited.jpg --output "$HOME/Music/CD Archive/album-01"
 ```
 
-### 保存済みイメージを使う
+画像は読み取り前に検証してコピーする。既存の出力先は上書きしない。
+`--edition "初回限定盤"`は任意の記録用ラベルで、画像の自動検索には使わない。
+相対パスはmiseの作業ディレクトリ（通常はプロジェクトルート）が基準。外部アプリからは絶対パスを推奨する。
+オプション一覧は`mise run import --help`で確認できる。
 
-`--device`の代わりに`--capture`を指定すると、CDを再読み取りせず、完成済みripの内容をコピーして処理する。
-以下のApple IDは今回のaikoのアルバム用であり、別CDには流用しない。
-
-```sh
-mise run import -- --capture artifacts/rip-20261020-231010 \
-  --output "$HOME/Music/CD Archive/album-02" \
-  --artwork ./covers/limited.jpg \
-  --edition "初回限定盤" --apple-album-id 6813318544
-```
-
-`--device`と`--capture`はどちらか一方だけ指定する。
-コピー対象は`audio.bin`・`toc.bin`・`report.json`と、存在する場合の`toc.json`・`disc.cue`・`reads.jsonl`。
-入力フォルダの無関係なファイルはコピーしない。元のイメージと画像は変更しない。
-
-### 出力先の構成
+### 完成品と保存用データ
 
 ```text
 <output>/
-  report.json          全体の成否・工程別の結果・成果物一覧
-  input-cover.jpg      開始時に保存した指定画像（PNGの場合は.png）
-  capture/             原本イメージ・TOC・CUE・読み取りログ
-  metadata/            曲情報・カバー・取得ログ
-  wav/                 無加工の曲別WAV
-  normalized/          音量調整済みWAV
-  aac/                 タグ未設定のApple AAC
-  tagged/              曲名・カバー付きの最終M4A、album.json、カバー
+  aac/                  完成品のM4A（音量調整・曲名・カバー設定済み）
+  capture/
+    audio.bin           未加工のCD音声イメージ
+    toc.bin / toc.json   曲の開始位置など
+    disc.cue            CUE
+    reads.jsonl         読み取り記録
+    report.json         原本の検証記録
+    metadata/           確定した曲情報・画像・取得記録
+    recipe.json         再生成の設定・ツール環境・ファイルハッシュ
+  logs/                 音量調整・変換・タグ付けなどの検証記録
+  report.json           全体の成否・成果物一覧
 ```
 
-指定画像はCD読み取り前に検証してコピーし、長い取り込みの途中で元画像が変更されても同じ画像を使う。
-処理順は原本保存またはコピー → 曲情報取得 → WAV切り出し → 音量調整 → AAC化 → タグ付け。
-原本・中間ファイルを残すため、CD1枚につき数GB程度の空きを見込む。
-`--passes`・`--retries`・`--chunk-sectors`はCDから直接取り込む場合だけ適用する。
-音量条件は`--target-lufs`・`--true-peak`・`--peak-headroom`で指定できる。
+YouTube Musicへ渡す音声は`aac/`内の`.m4a`。保存用データは`capture/`全体を保持する。
+アップロードはこのツールでは行わず、`shortcuts_app`など呼び出し側で扱う。
+
+WAV・音量調整済みWAV・タグ設定前AACは作業中だけ生成し、完成品の検証後に削除する。
+成功時は`wav/`・`normalized/`・`tagged/`や、タグ設定前のAACを残さない。
+削除するのは今回の新しい出力先に生成した音声だけで、入力や以前の出力は削除しない。
+処理中はCD1枚につき数GBの空きが必要。失敗時は調査できるよう中間ファイルも残す。
+
+### CDなしでAACを作り直す
+
+保存した`capture/`、またはそれを含むアルバムフォルダを指定する。
+
+```sh
+mise run import -- "/保存したアルバム/capture"
+```
+
+新しい保存先でAACを生成する。保存先も選ぶ場合は`--output`を追加する。
+本ツールで作った新形式の`capture/`には曲情報・画像・音量設定も含まれ、CDやメタデータのネット照会は不要。
+作業ディレクトリに別の`cover.jpg`があっても、保存済み画像を優先する。
+再生成時は保存設定を使い、明示した`--target-lufs`・`--true-peak`・`--peak-headroom`だけ上書きできる。
+
+元のPCMは同じデータから復元するが、ディザ・ライブラリ・macOSのAppleエンコーダーの違いにより、
+正規化WAVやM4Aのバイト一致までは保証しない。実行環境のセットアップも別途必要。
+以前の音声イメージだけのcaptureには曲名や画像が含まれないため、別途照合や入力が必要になる。
 
 ### 全体レポートと外部ツールからの利用
 
-進捗は標準エラーへ、全体レポートのJSONは標準出力と`<output>/report.json`へ出力する。
-引数や入力を事前確認して失敗した場合は出力フォルダを作らず、標準出力にエラーのJSONを返す。
-ただし、必須フラグ不足などUsageの解析エラーはmiseが処理するため、このJSONは返らない。
+進捗・入力案内は標準エラー、全体レポートのJSONは標準出力と`<output>/report.json`へ出力する。
+`schema_version: 2`、`operation: import`を持ち、`status`は`running`・`complete`・`failed`のいずれか。
+成功時は`result.directory: aac`と`result.archive_directory: capture`を返す。
+`result`のファイル参照は出力フォルダからの相対パスで、サイズとSHA-256を付ける。
+`stages`は工程別レポートを参照し、音声を削除した工程は`audio_retained: false`として区別する。
+工程別レポートには、履歴として処理中の絶対パスや、削除済み作業音声の情報も残る。
 
-`schema_version: 1`、`operation: import`を持ち、`status`は`running`・`complete`・`failed`のいずれか。
-`stages`には各工程の状態・レポートへの相対パス・レポートのSHA-256を保存する。
-成功時の`result`には最終音声・画像・アルバム情報・原本の相対パス、サイズ、SHA-256をまとめる。
-外部ツールは`status: complete`を確認し、`result`内のパスを出力フォルダと結合して成果物を取得できる。
-工程別レポートの`source_directory`などには、従来通り実行時の絶対パスも残る。
-
-失敗やCtrl-C時は全体を`failed`にし、未完了の成果物を`result`へ載せず、完了済み工程と途中の記録を残す。
-終了コードは成功0、失敗1、Ctrl-Cによる中断130。強制終了時には`running`の記録が残る場合がある。
+失敗時の`result`は`null`。引数・入力の事前確認で失敗した場合は、出力フォルダを作らずエラーJSONだけを返す。
+Usage自体の解析エラーはmiseが処理するため、このJSONは返らない。
+終了コードは成功0、失敗1、Ctrl-Cによる中断130。強制終了では`running`の記録が残る場合がある。
 `complete`は全工程の完了を示し、LUFS目標の達成は`result.all_targets_reached`で別に確認する。
 実CDとの全曲PCM比較は自動実行せず、`archival_verified`は常に`false`。
-検証結果は[一括処理の検証](docs/workflow-poc.md)を参照。
+検証結果は[自動取り込みと再生成の検証](docs/automatic-import.md)を参照。
 
 ## 工程別の実機検証手順
 

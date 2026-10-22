@@ -211,6 +211,10 @@ tempCodeRunnerFile.py
 # Local CD images, samples, and hardware reports (never commit audio)
 /artifacts/
 
+# Optional local artwork automatically picked up by the import task
+/cover.jpg
+/cover.png
+
 # Ruff stuff:
 .ruff_cache/
 
